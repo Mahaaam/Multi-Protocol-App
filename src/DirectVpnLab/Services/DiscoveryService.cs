@@ -9,7 +9,18 @@ namespace DirectVpnLab.Services;
 
 public sealed class DiscoveryService
 {
-    public const int MaxParallel = 3;
+    /// <summary>Keep below host anti-scan (30 NEW SYN / 10s / src IP across all ports).</summary>
+    public const int MaxParallel = 2;
+
+    /// <summary>Host iptables recent portscan: hitcount 30 / seconds 10 — stay well under.</summary>
+    public const int MaxServerSynPerWindow = 12;
+
+    public static readonly TimeSpan ServerSynWindow = TimeSpan.FromSeconds(10);
+    public static readonly TimeSpan MinServerSynGap = TimeSpan.FromMilliseconds(500);
+
+    private static readonly object ServerSynGate = new();
+    private static readonly Queue<long> ServerSynTicksMs = new();
+    private static long _lastServerSynMs;
 
     private readonly LiveLogService _log;
     private readonly LabCredentials _cred;
@@ -27,9 +38,10 @@ public sealed class DiscoveryService
         CancellationToken ct)
     {
         var swAll = Stopwatch.StartNew();
-        _log.Info("Starting protocol discovery (TEST ALL) — parallel up to 3");
+        _log.Info(
+            $"Starting protocol discovery (TEST ALL) — parallel up to {MaxParallel}, " +
+            $"server SYN budget ≤{MaxServerSynPerWindow}/{ServerSynWindow.TotalSeconds:F0}s (host anti-scan is 30/10s)");
         _log.Info("Windows default route will NOT be modified during discovery");
-
         EnsureNaiveDependency(methods);
 
         // Fresh TEST ALL: re-evaluate skips; do not keep prior Pass mixed into new ranking
@@ -120,6 +132,7 @@ public sealed class DiscoveryService
             }
 
             await sb.StartAsync(cfg, ct, readyDelayMs: 220).ConfigureAwait(false);
+            await WaitForServerSynBudgetAsync(ct).ConfigureAwait(false);
             var timeout = AdaptiveProbeTimeout(m, quick: true);
             var (success, latency, exitIp, err) = await ProbeViaProxyAsync(port, timeout, ct).ConfigureAwait(false);
             m.ProbeAttempts = 1;
@@ -332,6 +345,7 @@ public sealed class DiscoveryService
                 if (ok + remaining < 2) break;
 
                 attempts++;
+                await WaitForServerSynBudgetAsync(ct).ConfigureAwait(false);
                 var timeout = AdaptiveProbeTimeout(m, quick: false, sampleIndex: i, priorLatencies: latencies);
                 var (success, latency, ip, err) = await ProbeViaProxyAsync(port, timeout, ct).ConfigureAwait(false);
 
@@ -495,6 +509,78 @@ public sealed class DiscoveryService
         catch (Exception ex)
         {
             return (false, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Host anti-scan counts NEW SYN to any local port from the same source IP
+    /// (iptables recent name=portscan hitcount=30 seconds=10). Discovery opens a
+    /// distinct NL port per protocol — parallel probes can trip that threshold.
+    /// This gate limits intentional lab SYNs without changing server firewall.
+    /// </summary>
+    public async Task WaitForServerSynBudgetAsync(CancellationToken ct)
+    {
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            long waitMs;
+            lock (ServerSynGate)
+            {
+                var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                var windowStart = now - (long)ServerSynWindow.TotalMilliseconds;
+                while (ServerSynTicksMs.Count > 0 && ServerSynTicksMs.Peek() < windowStart)
+                {
+                    ServerSynTicksMs.Dequeue();
+                }
+
+                var sinceLast = now - _lastServerSynMs;
+                var gapWait = sinceLast >= (long)MinServerSynGap.TotalMilliseconds
+                    ? 0
+                    : (long)MinServerSynGap.TotalMilliseconds - sinceLast;
+
+                if (ServerSynTicksMs.Count < MaxServerSynPerWindow && gapWait <= 0)
+                {
+                    ServerSynTicksMs.Enqueue(now);
+                    _lastServerSynMs = now;
+                    return;
+                }
+
+                if (ServerSynTicksMs.Count >= MaxServerSynPerWindow)
+                {
+                    var releaseAt = ServerSynTicksMs.Peek() + (long)ServerSynWindow.TotalMilliseconds;
+                    waitMs = Math.Max(gapWait, releaseAt - now + 20);
+                }
+                else
+                {
+                    waitMs = Math.Max(20, gapWait);
+                }
+            }
+
+            _log.Info($"Server SYN budget: waiting {waitMs}ms to stay under host anti-scan (≤{MaxServerSynPerWindow}/{ServerSynWindow.TotalSeconds:F0}s)");
+            await Task.Delay(TimeSpan.FromMilliseconds(waitMs), ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Test helper — reset shared budget between unit checks.</summary>
+    public static void ResetServerSynBudgetForTests()
+    {
+        lock (ServerSynGate)
+        {
+            ServerSynTicksMs.Clear();
+            _lastServerSynMs = 0;
+        }
+    }
+
+    /// <summary>How many SYNs remain in the rolling window (for tests / diagnostics).</summary>
+    public static int ServerSynBudgetUsedForTests()
+    {
+        lock (ServerSynGate)
+        {
+            var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var windowStart = now - (long)ServerSynWindow.TotalMilliseconds;
+            while (ServerSynTicksMs.Count > 0 && ServerSynTicksMs.Peek() < windowStart)
+                ServerSynTicksMs.Dequeue();
+            return ServerSynTicksMs.Count;
         }
     }
 
