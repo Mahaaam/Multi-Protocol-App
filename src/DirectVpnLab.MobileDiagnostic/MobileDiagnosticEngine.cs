@@ -16,6 +16,8 @@ public sealed class PathCheckResult
     public string NetworkAdapter { get; init; } = "UNKNOWN";
     public string DefaultRoute { get; init; } = "UNKNOWN";
     public string EffectiveToServer { get; init; } = "UNKNOWN";
+    public string EffectiveInterface { get; init; } = "UNKNOWN";
+    public string EffectiveNextHop { get; init; } = "UNKNOWN";
     public string Gateway { get; init; } = "UNKNOWN";
     public string PublicIpv4A { get; init; } = "UNKNOWN";
     public string PublicIpv4B { get; init; } = "UNKNOWN";
@@ -24,6 +26,14 @@ public sealed class PathCheckResult
     public string BlockReason { get; init; } = "";
     public bool WireGuardEffective { get; init; }
     public IReadOnlyList<string> ActiveVpnAdapters { get; init; } = Array.Empty<string>();
+}
+
+public sealed class EffectiveRouteInfo
+{
+    public string InterfaceAlias { get; init; } = "UNKNOWN";
+    public string LocalIp { get; init; } = "";
+    public string NextHop { get; init; } = "";
+    public string Raw { get; init; } = "UNKNOWN";
 }
 
 public sealed class TcpSnapshot
@@ -66,7 +76,8 @@ public sealed class MobileRunReport
 /// </summary>
 public sealed class MobileDiagnosticEngine
 {
-    public const string AppVersion = "1.1.10-mobile-diag";
+    public const string AppVersion = "1.1.10-mobile-diag.2";
+    public const string RuntimeFolderName = "DirectVpnLab.MobileDiagnostic";
     public const string ServerIpDefault = "82.23.248.121";
     public const int ServerPortDefault = 40121;
 
@@ -101,10 +112,18 @@ public sealed class MobileDiagnosticEngine
     public MobileDiagnosticEngine(LiveLogService log)
     {
         _log = log;
+        ApplyIsolatedRuntime();
+    }
+
+    public static void ApplyIsolatedRuntime()
+    {
+        // Must not change main DirectVpnLab RuntimeDir — only this process sets override.
+        AppPaths.RuntimeFolderNameOverride = RuntimeFolderName;
     }
 
     public void EnsureReady()
     {
+        ApplyIsolatedRuntime();
         AppPaths.EnsureDirs();
         if (!File.Exists(AppPaths.CredentialsPath))
             throw new FileNotFoundException("credentials.json missing next to EXE (Assets\\certs\\credentials.json)");
@@ -112,94 +131,157 @@ public sealed class MobileDiagnosticEngine
             throw new FileNotFoundException("sing-box.exe missing (Assets\\sing-box\\sing-box.exe)");
         _cred = ProtocolCatalog.LoadCredentials();
         _connection = new ConnectionService(_log, _cred);
+        _log.Info($"RuntimeDir isolated → {AppPaths.RuntimeDir}");
+    }
+
+    /// <summary>
+    /// Pure path gate used by CheckNetwork and self-tests.
+    /// Requires exact Wi-Fi interface + NextHop match; hotspot alone is never enough.
+    /// </summary>
+    public static PathCheckResult EvaluatePathDecision(
+        string? wifiAlias,
+        string? wifiIp,
+        string? wifiGateway,
+        EffectiveRouteInfo route,
+        string? ipA,
+        string? ipB,
+        IReadOnlyList<string>? defaultRoutes = null,
+        IReadOnlyList<string>? vpnAdapters = null)
+    {
+        defaultRoutes ??= Array.Empty<string>();
+        vpnAdapters ??= Array.Empty<string>();
+
+        var gateway = string.IsNullOrWhiteSpace(wifiGateway) ? "UNKNOWN" : wifiGateway.Trim();
+        var adapter = string.IsNullOrWhiteSpace(wifiAlias) ? "UNKNOWN" : wifiAlias.Trim();
+        var effIf = string.IsNullOrWhiteSpace(route.InterfaceAlias) ? "UNKNOWN" : route.InterfaceAlias.Trim();
+        var nextHop = (route.NextHop ?? "").Trim();
+
+        var wgEffective = IsWireGuardInterface(effIf) ||
+                          defaultRoutes.Any(IsWireGuardDefaultRouteLine) ||
+                          vpnAdapters.Any(IsWireGuardAdapterName);
+
+        string publicIp;
+        string publicStatus;
+        if (!string.IsNullOrWhiteSpace(ipA) && !string.IsNullOrWhiteSpace(ipB))
+        {
+            if (string.Equals(ipA, ipB, StringComparison.Ordinal))
+            {
+                publicIp = ipA!;
+                publicStatus = "OK";
+            }
+            else
+            {
+                publicIp = $"A={ipA};B={ipB}";
+                publicStatus = "UNVERIFIED";
+            }
+        }
+        else
+        {
+            publicIp = "UNKNOWN";
+            publicStatus = "UNVERIFIED";
+        }
+
+        var interfaceMatch = !string.IsNullOrWhiteSpace(wifiAlias) &&
+                             string.Equals(effIf, wifiAlias.Trim(), StringComparison.OrdinalIgnoreCase);
+        var nextHopMatch = !string.IsNullOrWhiteSpace(wifiGateway) &&
+                           !string.IsNullOrWhiteSpace(nextHop) &&
+                           string.Equals(nextHop, wifiGateway.Trim(), StringComparison.OrdinalIgnoreCase);
+        // On-link default sometimes reports NextHop 0.0.0.0 — still require same interface + Wi-Fi local IP on that NIC.
+        if (!nextHopMatch &&
+            interfaceMatch &&
+            (nextHop is "0.0.0.0" or "") &&
+            !string.IsNullOrWhiteSpace(wifiIp) &&
+            string.Equals(route.LocalIp?.Trim(), wifiIp.Trim(), StringComparison.OrdinalIgnoreCase) &&
+            !string.IsNullOrWhiteSpace(wifiGateway))
+        {
+            nextHopMatch = true;
+        }
+
+        string mobileStatus;
+        var block = "";
+        var pathOk = false;
+
+        if (wgEffective)
+        {
+            mobileStatus = "BLOCKED — WireGuard still effective; deactivate tunnel WG first";
+            block = $"Effective interface={effIf} nextHop={nextHop} (WG path)";
+        }
+        else if (string.Equals(effIf, "UNKNOWN", StringComparison.OrdinalIgnoreCase) ||
+                 string.IsNullOrWhiteSpace(wifiAlias))
+        {
+            mobileStatus = "UNKNOWN — Wi-Fi adapter or effective route unresolved";
+            block = "Could not resolve Wi-Fi adapter or IPv4 route to server";
+        }
+        else if (publicStatus == "UNVERIFIED" && publicIp.StartsWith("A=", StringComparison.Ordinal))
+        {
+            mobileStatus = "UNVERIFIED — public IPv4 sources disagree";
+            block = $"Public IP mismatch: {publicIp}";
+        }
+        else if (publicStatus == "UNVERIFIED")
+        {
+            mobileStatus = "UNVERIFIED — public IPv4 lookup incomplete (do not assume prior mobile IP)";
+            block = "One or both public IP probes failed";
+        }
+        else if (interfaceMatch && nextHopMatch && publicStatus == "OK")
+        {
+            mobileStatus = "OK — effective IPv4 to server uses Wi-Fi + matching gateway";
+            pathOk = true;
+        }
+        else
+        {
+            mobileStatus = "BLOCKED — effective route is not the connected Wi-Fi/gateway pair";
+            block =
+                $"Need Interface={adapter} NextHop={gateway}; got Interface={effIf} NextHop={nextHop} LocalIp={route.LocalIp}";
+        }
+
+        return new PathCheckResult
+        {
+            PathOk = pathOk,
+            NetworkAdapter = string.IsNullOrWhiteSpace(wifiIp) ? adapter : $"{adapter} ({wifiIp})",
+            DefaultRoute = defaultRoutes.Count == 0 ? "NONE" : string.Join(" | ", defaultRoutes),
+            EffectiveToServer = route.Raw,
+            EffectiveInterface = effIf,
+            EffectiveNextHop = string.IsNullOrWhiteSpace(nextHop) ? "UNKNOWN" : nextHop,
+            Gateway = gateway,
+            PublicIpv4A = ipA ?? "UNKNOWN",
+            PublicIpv4B = ipB ?? "UNKNOWN",
+            PublicIpv4 = publicIp,
+            MobileNetworkStatus = mobileStatus,
+            BlockReason = block,
+            WireGuardEffective = wgEffective,
+            ActiveVpnAdapters = vpnAdapters
+        };
     }
 
     public PathCheckResult CheckNetwork()
     {
         var wifi = FindWifiIpv4();
         var defaults = ListDefaultRoutes();
-        var effective = FindEffectiveRoute(ServerIpDefault);
+        var route = FindEffectiveRoute(ServerIpDefault);
         var vpnAdapters = ListVpnLikeAdapters();
-        var wgEffective = effective.Contains("WG", StringComparison.OrdinalIgnoreCase) ||
-                          effective.Contains("WireGuard", StringComparison.OrdinalIgnoreCase) ||
-                          defaults.Any(d => d.Contains("WG", StringComparison.OrdinalIgnoreCase) &&
-                                            !d.Contains("Wi-Fi", StringComparison.OrdinalIgnoreCase));
-
         var (ipA, errA) = FetchPublicIp("https://api.ipify.org");
         var (ipB, errB) = FetchPublicIpFromTrace("https://1.1.1.1/cdn-cgi/trace");
 
-        string publicIp;
-        if (!string.IsNullOrWhiteSpace(ipA) && !string.IsNullOrWhiteSpace(ipB))
-            publicIp = string.Equals(ipA, ipB, StringComparison.Ordinal) ? ipA! : $"A={ipA};B={ipB}";
-        else if (!string.IsNullOrWhiteSpace(ipA))
-            publicIp = ipA!;
-        else if (!string.IsNullOrWhiteSpace(ipB))
-            publicIp = ipB!;
-        else
-            publicIp = "UNKNOWN";
+        var result = EvaluatePathDecision(
+            wifi.Alias, wifi.Ip, wifi.Gateway, route, ipA, ipB, defaults, vpnAdapters);
 
-        var gateway = wifi.Gateway ?? "UNKNOWN";
-        var adapter = wifi.Alias ?? "UNKNOWN";
-        var looksHotspot = gateway is "172.20.10.1" ||
-                           (wifi.Ip?.StartsWith("172.20.10.", StringComparison.Ordinal) == true);
-
-        string mobileStatus;
-        var block = "";
-        var pathOk = false;
-
-        if (wgEffective || vpnAdapters.Any(a => a.Contains("WireGuard", StringComparison.OrdinalIgnoreCase) ||
-                                                a.Equals("WG", StringComparison.OrdinalIgnoreCase)))
-        {
-            mobileStatus = "BLOCKED — WireGuard still effective; deactivate tunnel WG first";
-            block = "Effective path uses WireGuard (not interface name alone / not geo-IP)";
-        }
-        else if (effective.Contains("UNKNOWN", StringComparison.OrdinalIgnoreCase) &&
-                 string.IsNullOrWhiteSpace(wifi.Alias))
-        {
-            mobileStatus = "UNKNOWN — no Wi-Fi / route evidence";
-            block = "Could not resolve Wi-Fi adapter or route to server";
-        }
-        else if (publicIp == "UNKNOWN")
-        {
-            // Path may still be OK; do not invent previous mobile IP
-            mobileStatus = looksHotspot
-                ? "PARTIAL — hotspot path likely; public IP lookup UNKNOWN (do not assume prior IP)"
-                : "PARTIAL — public IP UNKNOWN; confirm route carefully";
-            pathOk = !wgEffective &&
-                     effective.Contains("Wi-Fi", StringComparison.OrdinalIgnoreCase);
-            if (!pathOk)
-                block = "Public IP unknown and effective route not clearly Wi-Fi";
-        }
-        else if (!wgEffective &&
-                 (effective.Contains("Wi-Fi", StringComparison.OrdinalIgnoreCase) ||
-                  effective.Contains(gateway, StringComparison.OrdinalIgnoreCase) ||
-                  looksHotspot))
-        {
-            mobileStatus = "OK — direct path (WireGuard not effective)";
-            pathOk = true;
-        }
-        else
-        {
-            mobileStatus = "BLOCKED — path not confirmed as direct Wi-Fi/mobile";
-            block = $"EffectiveToServer={effective}; DefaultRoutes={string.Join(" | ", defaults)}";
-        }
-
+        // Preserve probe error detail when IP missing
         return new PathCheckResult
         {
-            PathOk = pathOk,
-            NetworkAdapter = string.IsNullOrWhiteSpace(wifi.Ip)
-                ? adapter
-                : $"{adapter} ({wifi.Ip})",
-            DefaultRoute = defaults.Count == 0 ? "NONE" : string.Join(" | ", defaults),
-            EffectiveToServer = effective,
-            Gateway = gateway,
+            PathOk = result.PathOk,
+            NetworkAdapter = result.NetworkAdapter,
+            DefaultRoute = result.DefaultRoute,
+            EffectiveToServer = result.EffectiveToServer,
+            EffectiveInterface = result.EffectiveInterface,
+            EffectiveNextHop = result.EffectiveNextHop,
+            Gateway = result.Gateway,
             PublicIpv4A = ipA ?? $"FAIL:{errA}",
             PublicIpv4B = ipB ?? $"FAIL:{errB}",
-            PublicIpv4 = publicIp,
-            MobileNetworkStatus = mobileStatus,
-            BlockReason = block,
-            WireGuardEffective = wgEffective,
-            ActiveVpnAdapters = vpnAdapters
+            PublicIpv4 = result.PublicIpv4,
+            MobileNetworkStatus = result.MobileNetworkStatus,
+            BlockReason = result.BlockReason,
+            WireGuardEffective = result.WireGuardEffective,
+            ActiveVpnAdapters = result.ActiveVpnAdapters
         };
     }
 
@@ -210,6 +292,11 @@ public sealed class MobileDiagnosticEngine
         CancellationToken ct)
     {
         EnsureReady();
+
+        // Always re-validate path at START — stale CHECK must not run on wrong network.
+        setStatus("Re-checking path…");
+        var fresh = CheckNetwork();
+        path = fresh;
         if (!path.PathOk)
         {
             var denied = new MobileRunReport
@@ -329,37 +416,141 @@ public sealed class MobileDiagnosticEngine
     {
         try
         {
+            ApplyIsolatedRuntime();
+            var parts = new List<string>();
+
             if (_connection != null)
             {
+                // DisconnectAsync only kills ownership recorded under THIS RuntimeDir/StateDir.
                 var (ok, msg) = await _connection.DisconnectAsync().ConfigureAwait(false);
-                return ok ? $"OK: {msg}" : $"FAIL: {msg}";
+                parts.Add(ok ? $"disconnect:{msg}" : $"disconnect-FAIL:{msg}");
             }
-
-            // Best-effort: stop any discover-* sing-box left from this tool
-            foreach (var p in Process.GetProcessesByName("sing-box"))
+            else
             {
-                try
-                {
-                    var path = p.MainModule?.FileName ?? "";
-                    if (path.Contains("DirectVpnLab", StringComparison.OrdinalIgnoreCase) ||
-                        path.Contains("Mobile-Diagnostic", StringComparison.OrdinalIgnoreCase) ||
-                        path.Contains("MobileDiagnostic", StringComparison.OrdinalIgnoreCase))
-                    {
-                        p.Kill(entireProcessTree: true);
-                    }
-                }
-                catch
-                {
-                    // ignore access denied
-                }
+                parts.Add("disconnect:skipped(no ConnectionService)");
             }
 
-            return "OK: no ConnectionService; best-effort process scan done";
+            parts.Add(CleanOwnWorkFiles());
+            // Intentionally NO Process.GetProcessesByName("sing-box") / Kill —
+            // must never terminate main DirectVpnLab or third-party sing-box.
+            return "OK: " + string.Join("; ", parts);
         }
         catch (Exception ex)
         {
             return "FAIL: " + ex.Message;
         }
+    }
+
+    /// <summary>Deletes only config/work files under this tool's isolated WorkDir.</summary>
+    public static string CleanOwnWorkFiles()
+    {
+        ApplyIsolatedRuntime();
+        var work = AppPaths.WorkDir;
+        if (!Directory.Exists(work))
+            return "work:absent";
+
+        // Hard guard: never touch main DirectVpnLab runtime tree
+        var mainRuntime = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "DirectVpnLab");
+        if (work.StartsWith(mainRuntime + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(work, mainRuntime, StringComparison.OrdinalIgnoreCase))
+        {
+            return "work:REFUSED(main runtime)";
+        }
+
+        if (!work.Contains(RuntimeFolderName, StringComparison.OrdinalIgnoreCase))
+            return "work:REFUSED(unexpected path)";
+
+        var n = 0;
+        foreach (var f in Directory.EnumerateFiles(work, "discover-*.json"))
+        {
+            try { File.Delete(f); n++; } catch { /* ignore locked */ }
+        }
+
+        return $"work:deleted={n}";
+    }
+
+    public static string RunSafetySelfTests()
+    {
+        ApplyIsolatedRuntime();
+        var lines = new List<string>();
+        var fail = 0;
+
+        void Assert(string name, bool cond)
+        {
+            lines.Add(cond ? $"PASS {name}" : $"FAIL {name}");
+            if (!cond) fail++;
+        }
+
+        // 1) WG dominant → START blocked
+        var wg = EvaluatePathDecision(
+            "Wi-Fi", "172.20.10.2", "172.20.10.1",
+            new EffectiveRouteInfo { InterfaceAlias = "WG", LocalIp = "10.100.30.8", NextHop = "0.0.0.0", Raw = "WG" },
+            "86.55.9.123", "86.55.9.123");
+        Assert("WG_blocks_PathOk", !wg.PathOk && wg.WireGuardEffective);
+
+        // 2) Hotspot present but effective not Wi-Fi → not PASS
+        var hotspotWrongIf = EvaluatePathDecision(
+            "Wi-Fi", "172.20.10.2", "172.20.10.1",
+            new EffectiveRouteInfo { InterfaceAlias = "Ethernet", LocalIp = "192.168.1.10", NextHop = "192.168.1.1", Raw = "Ethernet" },
+            "86.55.9.123", "86.55.9.123");
+        Assert("hotspot_alone_not_PathOk", !hotspotWrongIf.PathOk);
+
+        // 3) Correct Wi-Fi + gateway → PASS
+        var ok = EvaluatePathDecision(
+            "Wi-Fi", "172.20.10.2", "172.20.10.1",
+            new EffectiveRouteInfo { InterfaceAlias = "Wi-Fi", LocalIp = "172.20.10.2", NextHop = "172.20.10.1", Raw = "Wi-Fi" },
+            "86.55.9.123", "86.55.9.123");
+        Assert("wifi_gateway_PathOk", ok.PathOk);
+
+        // Public IP mismatch → UNVERIFIED / blocked
+        var mismatch = EvaluatePathDecision(
+            "Wi-Fi", "172.20.10.2", "172.20.10.1",
+            new EffectiveRouteInfo { InterfaceAlias = "Wi-Fi", LocalIp = "172.20.10.2", NextHop = "172.20.10.1", Raw = "Wi-Fi" },
+            "1.1.1.1", "8.8.8.8");
+        Assert("public_ip_mismatch_blocks", !mismatch.PathOk &&
+                                            mismatch.MobileNetworkStatus.Contains("UNVERIFIED", StringComparison.Ordinal));
+
+        // 4) Stale CHECK simulation: first OK, second WG → must deny on re-check values
+        Assert("stale_path_recheck_denies", ok.PathOk && !wg.PathOk);
+
+        // 5/6) Runtime isolation + cleanup refuses main tree
+        Assert("runtime_isolated",
+            AppPaths.RuntimeDir.EndsWith(RuntimeFolderName, StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(AppPaths.RuntimeDir,
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DirectVpnLab"),
+                StringComparison.OrdinalIgnoreCase));
+
+        var clean = CleanOwnWorkFiles();
+        Assert("cleanup_own_workdir_only",
+            clean.StartsWith("work:", StringComparison.Ordinal) &&
+            !clean.Contains("REFUSED(main", StringComparison.Ordinal));
+
+        // Guard: CleanOwnWorkFiles path must never equal main work
+        var mainWork = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "DirectVpnLab", "work");
+        Assert("workdir_not_main",
+            !string.Equals(AppPaths.WorkDir, mainWork, StringComparison.OrdinalIgnoreCase));
+
+        lines.Add(fail == 0 ? "SAFETY_SELFTEST=PASS" : $"SAFETY_SELFTEST=FAIL count={fail}");
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    private static bool IsWireGuardInterface(string alias) =>
+        alias.Equals("WG", StringComparison.OrdinalIgnoreCase) ||
+        alias.Contains("WireGuard", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsWireGuardAdapterName(string name) =>
+        name.Equals("WG", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains("WireGuard", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsWireGuardDefaultRouteLine(string line)
+    {
+        // "WG via 0.0.0.0 metric=0" — interface token before " via "
+        var iface = line.Split(" via ", StringSplitOptions.TrimEntries).FirstOrDefault() ?? line;
+        return IsWireGuardInterface(iface);
     }
 
     public (string jsonPath, string txtPath) SaveReport(MobileRunReport? report = null)
@@ -580,7 +771,7 @@ public sealed class MobileDiagnosticEngine
         return list;
     }
 
-    private static string FindEffectiveRoute(string destIp)
+    private static EffectiveRouteInfo FindEffectiveRoute(string destIp)
     {
         try
         {
@@ -589,21 +780,35 @@ public sealed class MobileDiagnosticEngine
                 FileName = "powershell",
                 Arguments =
                     $"-NoProfile -Command \"$r=Find-NetRoute -RemoteIPAddress {destIp} | Select-Object -First 1; " +
-                    "if($null -eq $r){'UNKNOWN'} else { '{0} ip={1} nexthop={2}' -f $r.InterfaceAlias,$r.IPAddress,$r.NextHop }\"",
+                    "if($null -eq $r){'UNKNOWN||'} else { '{0}|{1}|{2}' -f $r.InterfaceAlias,$r.IPAddress,$r.NextHop }\"",
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 CreateNoWindow = true
             };
             using var p = Process.Start(psi);
-            if (p == null) return "UNKNOWN";
+            if (p == null)
+                return new EffectiveRouteInfo { Raw = "UNKNOWN" };
             var output = p.StandardOutput.ReadToEnd().Trim();
             p.WaitForExit(5000);
-            return string.IsNullOrWhiteSpace(output) ? "UNKNOWN" : output;
+            if (string.IsNullOrWhiteSpace(output) || output.StartsWith("UNKNOWN", StringComparison.OrdinalIgnoreCase))
+                return new EffectiveRouteInfo { Raw = string.IsNullOrWhiteSpace(output) ? "UNKNOWN" : output };
+
+            var parts = output.Split('|');
+            var alias = parts.Length > 0 ? parts[0].Trim() : "UNKNOWN";
+            var local = parts.Length > 1 ? parts[1].Trim() : "";
+            var hop = parts.Length > 2 ? parts[2].Trim() : "";
+            return new EffectiveRouteInfo
+            {
+                InterfaceAlias = string.IsNullOrWhiteSpace(alias) ? "UNKNOWN" : alias,
+                LocalIp = local,
+                NextHop = hop,
+                Raw = $"{alias} ip={local} nexthop={hop}"
+            };
         }
         catch (Exception ex)
         {
-            return "ERROR:" + ex.Message;
+            return new EffectiveRouteInfo { Raw = "ERROR:" + ex.Message };
         }
     }
 

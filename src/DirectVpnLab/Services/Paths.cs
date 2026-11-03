@@ -5,13 +5,19 @@ namespace DirectVpnLab.Services;
 
 public static class AppPaths
 {
+    /// <summary>
+    /// Optional LocalAppData subfolder override (e.g. Mobile Diagnostic).
+    /// Null = default "DirectVpnLab". Main app must leave this unset.
+    /// </summary>
+    public static string? RuntimeFolderNameOverride { get; set; }
+
     public static string BaseDir =>
         Path.GetDirectoryName(Environment.ProcessPath)
         ?? AppContext.BaseDirectory;
 
     public static string RuntimeDir => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "DirectVpnLab");
+        string.IsNullOrWhiteSpace(RuntimeFolderNameOverride) ? "DirectVpnLab" : RuntimeFolderNameOverride);
 
     public static string WorkDir => Path.Combine(RuntimeDir, "work");
     public static string LogDir => Path.Combine(RuntimeDir, "logs");

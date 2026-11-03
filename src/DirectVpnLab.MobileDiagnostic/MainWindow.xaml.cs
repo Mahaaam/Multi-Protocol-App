@@ -17,12 +17,18 @@ public partial class MainWindow : Window
         _log = new LiveLogService(Dispatcher);
         _engine = new MobileDiagnosticEngine(_log);
         _log.Changed += () => Dispatcher.BeginInvoke(SyncLog);
+        Closing += (_, _) =>
+        {
+            try { _engine.CancelAndCleanupAsync().GetAwaiter().GetResult(); } catch { /* ignore on close */ }
+        };
         try
         {
             _engine.EnsureReady();
             _log.Info($"Ready {MobileDiagnosticEngine.AppVersion}");
+            _log.Info($"RuntimeDir → {AppPaths.RuntimeDir}");
             _log.Info($"Reports → {MobileDiagnosticEngine.ReportsDir}");
             _log.Info("Admin NOT required (PROXY-ONLY / asInvoker). Do not change WireGuard from this tool.");
+            _log.Warn("LOCAL ONLY — publish folder may contain credentials/keys; do not redistribute.");
         }
         catch (Exception ex)
         {
@@ -52,18 +58,15 @@ public partial class MainWindow : Window
                 _lastPath = _engine.CheckNetwork();
             }).ConfigureAwait(true);
 
-            var p = _lastPath!;
-            ValAdapter.Text = p.NetworkAdapter;
-            ValRoute.Text = p.DefaultRoute + "\n→ " + p.EffectiveToServer;
-            ValPublicIp.Text = p.PublicIpv4 == "UNKNOWN"
-                ? $"UNKNOWN (A={p.PublicIpv4A}; B={p.PublicIpv4B})"
-                : p.PublicIpv4;
-            ValMobile.Text = p.MobileNetworkStatus;
-            BtnStart.IsEnabled = p.PathOk;
-            ValPhase.Text = p.PathOk ? "Path OK — you may START C01 TEST" : "Path blocked — fix WG / retry CHECK";
-            if (!string.IsNullOrWhiteSpace(p.BlockReason))
-                _log.Warn(p.BlockReason);
-            _log.Info($"CHECK: PathOk={p.PathOk} public={p.PublicIpv4} effective={p.EffectiveToServer}");
+            ApplyPathToUi(_lastPath!);
+            ValPhase.Text = _lastPath!.PathOk
+                ? "Path OK — you may START C01 TEST"
+                : "Path blocked — fix WG / retry CHECK";
+            if (!string.IsNullOrWhiteSpace(_lastPath.BlockReason))
+                _log.Warn(_lastPath.BlockReason);
+            _log.Info(
+                $"CHECK: PathOk={_lastPath.PathOk} public={_lastPath.PublicIpv4} " +
+                $"if={_lastPath.EffectiveInterface} hop={_lastPath.EffectiveNextHop}");
         }
         catch (Exception ex)
         {
@@ -77,28 +80,51 @@ public partial class MainWindow : Window
         }
     }
 
+    private void ApplyPathToUi(PathCheckResult p)
+    {
+        ValAdapter.Text = p.NetworkAdapter;
+        ValRoute.Text =
+            p.DefaultRoute + "\n→ " + p.EffectiveToServer +
+            $"\n(if={p.EffectiveInterface} hop={p.EffectiveNextHop} gw={p.Gateway})";
+        ValPublicIp.Text = p.PublicIpv4 is "UNKNOWN" || p.PublicIpv4.StartsWith("A=", StringComparison.Ordinal)
+            ? $"{p.PublicIpv4} (A={p.PublicIpv4A}; B={p.PublicIpv4B})"
+            : p.PublicIpv4;
+        ValMobile.Text = p.MobileNetworkStatus;
+        BtnStart.IsEnabled = p.PathOk;
+    }
+
     private async void Start_Click(object sender, RoutedEventArgs e)
     {
         if (_busy) return;
-        if (_lastPath is not { PathOk: true })
-        {
-            MessageBox.Show(this, "Run CHECK NETWORK first and ensure path is direct (WG off).", "Blocked",
-                MessageBoxButton.OK, MessageBoxImage.Warning);
-            return;
-        }
 
         SetBusy(true);
         BtnSave.IsEnabled = false;
-        ValDlStatus.Text = "RUNNING";
-        ValProgress.Text = "0 / 262144";
-        ValSpeed.Text = "—";
-        ValExitIp.Text = "—";
-        ValTcp.Text = "…";
-        ValCleanup.Text = "—";
-        _runCts = new CancellationTokenSource();
-
+        ValPhase.Text = "Re-checking path before START…";
+        _runCts = null;
         try
         {
+            // Fresh CHECK at START — ignore stale PathOk from earlier CHECK.
+            await Task.Run(() => { _lastPath = _engine.CheckNetwork(); }).ConfigureAwait(true);
+            var pathNow = _lastPath ?? throw new InvalidOperationException("path check returned null");
+            ApplyPathToUi(pathNow);
+            if (!pathNow.PathOk)
+            {
+                MessageBox.Show(this,
+                    "Path not OK on re-check. Deactivate WG and confirm Wi-Fi/gateway to NL, then CHECK again.\n" +
+                    pathNow.MobileNetworkStatus,
+                    "Blocked", MessageBoxButton.OK, MessageBoxImage.Warning);
+                ValPhase.Text = "START blocked — path re-check failed";
+                return;
+            }
+
+            ValDlStatus.Text = "RUNNING";
+            ValProgress.Text = "0 / 262144";
+            ValSpeed.Text = "—";
+            ValExitIp.Text = "—";
+            ValTcp.Text = "…";
+            ValCleanup.Text = "—";
+            _runCts = new CancellationTokenSource();
+
             var report = await _engine.RunC01TestAsync(
                 _lastPath,
                 status => Dispatcher.BeginInvoke(() => ValPhase.Text = status),
@@ -140,6 +166,7 @@ public partial class MainWindow : Window
             _runCts?.Dispose();
             _runCts = null;
             SetBusy(false);
+            BtnStart.IsEnabled = _lastPath is { PathOk: true };
         }
     }
 
