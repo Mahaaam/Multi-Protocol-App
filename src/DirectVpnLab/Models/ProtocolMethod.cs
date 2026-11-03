@@ -14,8 +14,10 @@ public enum ConnectionUiState
     Disconnected,
     Testing,
     Connecting,
+    Verifying,
     Connected,
     Degraded,
+    Switching,
     Failed
 }
 

@@ -122,10 +122,12 @@ public static class ConfigFactory
                     ["type"] = "tun",
                     ["tag"] = "tun-in",
                     ["interface_name"] = "DirectVpnLab",
+                    // 1280: safer on cellular / nested tunnels (PMTUD issues with larger MTU)
                     ["address"] = new JsonArray { "172.19.0.1/30" },
-                    ["mtu"] = 1400,
+                    ["mtu"] = 1280,
                     ["auto_route"] = true,
                     ["strict_route"] = true,
+                    ["dns_mode"] = "hijack",
                     ["stack"] = "mixed"
                 }
             },

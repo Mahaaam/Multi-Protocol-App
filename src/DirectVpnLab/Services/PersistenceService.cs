@@ -19,7 +19,17 @@ public sealed class PersistedLabState
     public string? StaleReason { get; set; }
     public bool LastTestIncomplete { get; set; }
     public List<PersistedMethodResult> Methods { get; set; } = new();
+    public List<TunFailureRecord> TunFailures { get; set; } = new();
     public UiPrefs Ui { get; set; } = new();
+}
+
+public sealed class TunFailureRecord
+{
+    public string MethodId { get; set; } = "";
+    public string NetworkFingerprint { get; set; } = "";
+    public string ReasonCategory { get; set; } = "";
+    public string Detail { get; set; } = "";
+    public DateTime FailedAtUtc { get; set; } = DateTime.UtcNow;
 }
 
 public sealed class PersistedMethodResult
@@ -164,7 +174,8 @@ public sealed class PersistenceService
         string? bestMethodId,
         bool resultsStale = false,
         string? staleReason = null,
-        bool lastTestIncomplete = false)
+        bool lastTestIncomplete = false,
+        IEnumerable<TunFailureRecord>? tunFailures = null)
     {
         var list = methods.ToList();
         var state = new PersistedLabState
@@ -179,6 +190,14 @@ public sealed class PersistenceService
             ResultsStale = resultsStale,
             StaleReason = staleReason,
             LastTestIncomplete = lastTestIncomplete,
+            TunFailures = tunFailures?.Select(f => new TunFailureRecord
+            {
+                MethodId = f.MethodId,
+                NetworkFingerprint = f.NetworkFingerprint,
+                ReasonCategory = f.ReasonCategory,
+                Detail = f.Detail,
+                FailedAtUtc = f.FailedAtUtc
+            }).ToList() ?? new List<TunFailureRecord>(),
             Methods = list.Select(m => new PersistedMethodResult
             {
                 Id = m.Id,
@@ -200,6 +219,53 @@ public sealed class PersistenceService
             }).ToList()
         };
         return state;
+    }
+
+    public IReadOnlyList<string> GetTunFailureIdsForNetwork(PersistedLabState state, string networkFp)
+    {
+        PruneStaleTunFailures(state, networkFp);
+        return state.TunFailures
+            .Where(f => string.Equals(f.NetworkFingerprint, networkFp, StringComparison.OrdinalIgnoreCase))
+            .Select(f => f.MethodId)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    public void RecordTunFailure(PersistedLabState state, string methodId, string networkFp, string category, string detail)
+    {
+        PruneStaleTunFailures(state, networkFp);
+        state.TunFailures.RemoveAll(f =>
+            string.Equals(f.MethodId, methodId, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(f.NetworkFingerprint, networkFp, StringComparison.OrdinalIgnoreCase));
+        state.TunFailures.Add(new TunFailureRecord
+        {
+            MethodId = methodId,
+            NetworkFingerprint = networkFp,
+            ReasonCategory = category,
+            Detail = detail.Length <= 240 ? detail : detail[..240],
+            FailedAtUtc = DateTime.UtcNow
+        });
+    }
+
+    public void ClearTunFailure(PersistedLabState state, string methodId, string networkFp)
+    {
+        state.TunFailures.RemoveAll(f =>
+            string.Equals(f.MethodId, methodId, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(f.NetworkFingerprint, networkFp, StringComparison.OrdinalIgnoreCase));
+    }
+
+    public void ClearTunFailuresForNetwork(PersistedLabState state, string networkFp)
+    {
+        state.TunFailures.RemoveAll(f =>
+            string.Equals(f.NetworkFingerprint, networkFp, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static void PruneStaleTunFailures(PersistedLabState state, string currentFp)
+    {
+        // Drop failures from other networks; keep current-network failures up to 24h
+        state.TunFailures.RemoveAll(f =>
+            !string.Equals(f.NetworkFingerprint, currentFp, StringComparison.OrdinalIgnoreCase) ||
+            DateTime.UtcNow - f.FailedAtUtc > TimeSpan.FromHours(24));
     }
 
     /// <summary>Update a single method inside an existing persisted state (Quick Recheck / connect).</summary>

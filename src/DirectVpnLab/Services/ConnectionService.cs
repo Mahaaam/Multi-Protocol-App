@@ -19,15 +19,22 @@ public sealed class ConnectionService
     private ProtocolMethod? _active;
     private bool _verifiedConnected;
     private bool _pathVerified;
+    private bool _usableInternetVerified;
     private string? _netBeforePath;
     private ProcessOwnership? _ownership;
+    private string? _lastHealthCategory;
+    private int _sharedHealthFailStreak;
+    private string? _sharedHealthCategory;
 
     public ProtocolMethod? ActiveMethod => _active;
     public bool TunnelPathVerified => _pathVerified;
+    public bool UsableInternetVerified => _usableInternetVerified;
+    public string? LastHealthFailureCategory => _lastHealthCategory;
 
     public bool IsConnected =>
         _verifiedConnected &&
         _pathVerified &&
+        _usableInternetVerified &&
         _tunProcess?.IsRunning == true &&
         _active != null &&
         TunInterfaceUp();
@@ -64,9 +71,13 @@ public sealed class ConnectionService
         _log.Info("Orphan cleanup finished for Direct VPN Lab markers");
     }
 
+    /// <param name="onPhase">Optional UI callback: (phase, detail) e.g. VERIFYING / SWITCHING.</param>
+    /// <param name="onCandidateFailed">Fired after a candidate fails TUN/usable-internet (before next attempt).</param>
     public async Task<(bool ok, string message)> ConnectBestAsync(
         IEnumerable<ProtocolMethod> rankedPass,
-        CancellationToken ct)
+        CancellationToken ct,
+        Action<string, string>? onPhase = null,
+        Action<ProtocolMethod, string>? onCandidateFailed = null)
     {
         var fatal = CheckFatalPrerequisites();
         if (fatal != null)
@@ -87,29 +98,46 @@ public sealed class ConnectionService
         }
 
         WarnIfOtherVpn();
+        _sharedHealthFailStreak = 0;
+        _sharedHealthCategory = null;
 
         string? lastFail = null;
-        foreach (var m in candidates)
+        var attempted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < candidates.Count; i++)
         {
+            var m = candidates[i];
             ct.ThrowIfCancellationRequested();
+            if (!attempted.Add(m.Id))
+            {
+                continue; // each protocol at most once per connect attempt
+            }
 
-            // Re-check fatal gates between candidates (admin revoked, wintun removed)
             fatal = CheckFatalPrerequisites();
             if (fatal != null)
             {
                 _log.Fail(fatal);
                 _verifiedConnected = false;
                 _pathVerified = false;
+                _usableInternetVerified = false;
                 return (false, fatal);
+            }
+
+            if (i > 0)
+            {
+                var nextLabel = $"{m.Id} {m.DisplayName}";
+                onPhase?.Invoke("SWITCHING", $"Switching to {nextLabel}");
+                _log.Info($"SWITCHING → {nextLabel}");
             }
 
             _log.Info($"Starting Windows tunnel with {m.Id} {m.DisplayName}");
             await CleanupTunnelAsync(verifyInternetRestored: false);
-            var (ok, msg) = await TryConnectMethodAsync(m, ct);
+            var (ok, msg) = await TryConnectMethodAsync(m, ct, onPhase);
             if (ok)
             {
                 _active = m;
                 _verifiedConnected = true;
+                _sharedHealthFailStreak = 0;
+                _sharedHealthCategory = null;
                 return (true, msg);
             }
 
@@ -117,17 +145,39 @@ public sealed class ConnectionService
             _log.Warn($"Tunnel candidate failed: {lastFail}");
             _verifiedConnected = false;
             _pathVerified = false;
+            _usableInternetVerified = false;
+            try { onCandidateFailed?.Invoke(m, msg); } catch { /* UI callback must not break cascade */ }
             await CleanupTunnelAsync(verifyInternetRestored: false);
 
-            // Fatal class errors stop the whole cascade
-            if (IsFatalConnectError(msg))
+            if (IsFatalConnectError(msg) || IsSharedTunConfigFailure(msg))
             {
                 return (false, msg);
+            }
+
+            // Same health category on consecutive protocols → shared tunnel/DNS problem
+            var cat = _lastHealthCategory ?? ClassifyHealthCategory(msg);
+            if (!string.IsNullOrEmpty(cat) &&
+                string.Equals(cat, _sharedHealthCategory, StringComparison.OrdinalIgnoreCase))
+            {
+                _sharedHealthFailStreak++;
+            }
+            else
+            {
+                _sharedHealthCategory = cat;
+                _sharedHealthFailStreak = 1;
+            }
+
+            if (_sharedHealthFailStreak >= 2 && IsSharedHealthCategory(cat))
+            {
+                var shared = $"Shared TUN/DNS failure ({cat}) after {_sharedHealthFailStreak} protocols — stopping cascade";
+                _log.Fail(shared);
+                return (false, shared);
             }
         }
 
         _verifiedConnected = false;
         _pathVerified = false;
+        _usableInternetVerified = false;
         return (false, lastFail != null
             ? $"CONNECTION FAILED — last error: {lastFail}"
             : "CONNECTION FAILED");
@@ -177,6 +227,7 @@ public sealed class ConnectionService
         _log.Info("Disconnect requested");
         _verifiedConnected = false;
         _pathVerified = false;
+        _usableInternetVerified = false;
         var (cleanOk, cleanMsg) = await CleanupTunnelAsync(verifyInternetRestored: true);
         _active = null;
         if (!cleanOk)
@@ -189,8 +240,13 @@ public sealed class ConnectionService
         return (true, "Disconnected and network cleanup verified");
     }
 
-    private async Task<(bool ok, string message)> TryConnectMethodAsync(ProtocolMethod m, CancellationToken ct)
+    private async Task<(bool ok, string message)> TryConnectMethodAsync(
+        ProtocolMethod m,
+        CancellationToken ct,
+        Action<string, string>? onPhase)
     {
+        _usableInternetVerified = false;
+        _lastHealthCategory = null;
         try
         {
             if (!IsAdministrator())
@@ -249,37 +305,49 @@ public sealed class ConnectionService
             _pathVerified = true;
             _log.Info($"Effective route verified via DirectVpnLab ({pathDetail})");
 
-            _log.Info("Checking DNS / HTTPS via TUN (system proxy disabled)");
-            var (httpsOk, exitIp, detail) = await VerifyInternetAsync(ct);
-            if (!httpsOk)
+            onPhase?.Invoke("VERIFYING", $"Verifying real internet via TUN ({m.Id})");
+            _log.Info($"VERIFYING usable internet via TUN for {m.Id} (DNS + domain HTTPS + data transfer)");
+            var health = await VerifyUsableInternetAsync(ct, fullCheck: true);
+            _lastHealthCategory = health.Category;
+            if (!health.Ok)
             {
                 _pathVerified = false;
-                return (false, $"Internet Verification Failed: {detail}");
+                _usableInternetVerified = false;
+                _log.Fail(
+                    $"Health FAIL {m.Id}: cat={health.Category} dns={health.DnsOk} https={health.HttpsOk} " +
+                    $"bytes={health.BytesReceived} elapsed={health.ElapsedMs:F0}ms exit={health.ExitIp ?? "-"} — {health.Detail}");
+                return (false, $"Usable Internet Failed [{health.Category}]: {health.Detail}");
             }
 
-            if (!IsExactExpectedExit(exitIp))
+            if (!IsExactExpectedExit(health.ExitIp))
             {
                 _pathVerified = false;
-                return (false, $"Exit IP Mismatch: got {exitIp} expected {_cred.server_ip}");
+                _usableInternetVerified = false;
+                _lastHealthCategory = "EXIT_IP";
+                return (false, $"Exit IP Mismatch: got {health.ExitIp} expected {_cred.server_ip}");
             }
 
-            // Re-check path after traffic (still TUN)
             var (pathOk2, pathDetail2) = VerifyTrafficUsesTun(new[] { "1.1.1.1" });
             if (!pathOk2 || !TunInterfaceUp())
             {
                 _pathVerified = false;
-                return (false, $"Route Path Error after HTTPS: {pathDetail2}");
+                _usableInternetVerified = false;
+                return (false, $"Route Path Error after health check: {pathDetail2}");
             }
 
-            _log.Info($"Exit IP verified: {exitIp}");
-            _log.Pass($"CONNECTED - {m.Id} {m.DisplayName}");
-            m.ExitIp = exitIp;
+            _usableInternetVerified = true;
+            _log.Info(
+                $"Health PASS {m.Id}: dns=OK https={health.HttpsOk} download={health.BytesReceived}B " +
+                $"in {health.ElapsedMs:F0}ms exit={health.ExitIp} ipv6={health.Ipv6Note}");
+            _log.Pass($"CONNECTED - {m.Id} {m.DisplayName} (usable internet verified)");
+            m.ExitIp = health.ExitIp;
             File.WriteAllText(Path.Combine(AppPaths.StateDir, "active-method.txt"), m.Id);
             return (true, $"CONNECTED via {m.DisplayName}");
         }
         catch (Exception ex)
         {
             _pathVerified = false;
+            _usableInternetVerified = false;
             var msg = ex.Message;
             if (IsSharedTunConfigFailure(msg) || IsFatalMessage(msg))
                 msg = "TUN Config Invalid (shared/fatal): " + TrimErr(msg);
@@ -340,85 +408,280 @@ public sealed class ConnectionService
     private static string TrimErr(string s) =>
         string.IsNullOrWhiteSpace(s) ? "" : (s.Length <= 220 ? s.Trim() : s.Trim()[..220]);
 
-    private async Task<(bool ok, string? exitIp, string detail)> VerifyInternetAsync(CancellationToken ct)
+    public sealed class TunHealthResult
     {
+        public bool Ok { get; init; }
+        public string? ExitIp { get; init; }
+        public string Detail { get; init; } = "";
+        public string Category { get; init; } = "OTHER";
+        public bool DnsOk { get; init; }
+        public int HttpsOk { get; init; }
+        public long BytesReceived { get; init; }
+        public double ElapsedMs { get; init; }
+        public string Ipv6Note { get; init; } = "skipped";
+    }
+
+    /// <summary>
+    /// Real usable-internet check through the Windows default path (TUN when connected).
+    /// Tiny IP-literal HTTPS alone is NOT enough — requires DNS + named HTTPS + payload transfer.
+    /// </summary>
+    public async Task<TunHealthResult> VerifyUsableInternetAsync(CancellationToken ct, bool fullCheck)
+    {
+        var swAll = Stopwatch.StartNew();
         var handler = new HttpClientHandler
         {
             UseProxy = false,
             Proxy = null,
             AllowAutoRedirect = true
         };
-        using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(20) };
-
-        var destinations = new[]
+        using var client = new HttpClient(handler)
         {
-            "https://1.1.1.1/cdn-cgi/trace",
-            "https://api.ipify.org",
-            "https://www.cloudflare.com/cdn-cgi/trace"
+            Timeout = fullCheck ? TimeSpan.FromSeconds(22) : TimeSpan.FromSeconds(14)
         };
 
-        string? ip = null;
-        var successes = 0;
-        string lastErr = "no destination succeeded";
-        foreach (var url in destinations)
+        // 1) DNS resolution (distinct from raw-IP reachability)
+        string? dnsErr = null;
+        try
         {
+            var addrs = await System.Net.Dns.GetHostAddressesAsync("www.cloudflare.com", ct);
+            if (addrs.Length == 0)
+            {
+                dnsErr = "DNS returned no addresses for www.cloudflare.com";
+            }
+        }
+        catch (Exception ex)
+        {
+            dnsErr = $"DNS resolve failed: {ex.Message}";
+        }
+
+        if (dnsErr != null)
+        {
+            return FailHealth("DNS", dnsErr, dnsOk: false, httpsOk: 0, bytes: 0, swAll.Elapsed.TotalMilliseconds);
+        }
+
+        // 2) Named-host HTTPS with real body (not IP literals alone)
+        var namedHosts = new[]
+        {
+            "https://www.cloudflare.com/cdn-cgi/trace",
+            "https://www.microsoft.com"
+        };
+        string? exitIp = null;
+        var httpsOk = 0;
+        string lastHttpsErr = "no named HTTPS success";
+        foreach (var url in namedHosts)
+        {
+            ct.ThrowIfCancellationRequested();
             try
             {
-                using var resp = await client.GetAsync(url, ct);
+                using var resp = await client.GetAsync(url, HttpCompletionOption.ResponseContentRead, ct);
                 if (!resp.IsSuccessStatusCode)
                 {
-                    lastErr = $"HTTP {(int)resp.StatusCode} for {url}";
+                    lastHttpsErr = $"HTTP {(int)resp.StatusCode} {url}";
                     continue;
                 }
                 var body = await resp.Content.ReadAsStringAsync(ct);
-                successes++;
-                if (url.Contains("ipify", StringComparison.OrdinalIgnoreCase))
+                if (string.IsNullOrWhiteSpace(body) || body.Length < 16)
                 {
-                    ip = body.Trim();
+                    lastHttpsErr = $"Empty/short body from {url}";
+                    continue;
                 }
-                else
+                httpsOk++;
+                if (url.Contains("cdn-cgi/trace", StringComparison.OrdinalIgnoreCase))
                 {
                     foreach (var line in body.Split('\n'))
                     {
                         if (line.StartsWith("ip=", StringComparison.OrdinalIgnoreCase))
                         {
-                            ip ??= line[3..].Trim();
+                            exitIp ??= line[3..].Trim();
                         }
                     }
                 }
             }
             catch (Exception ex)
             {
-                lastErr = ex.Message;
+                lastHttpsErr = $"{url}: {ex.Message}";
             }
         }
 
-        if (successes >= 2 && IsExactExpectedExit(ip))
+        // Need at least one solid named HTTPS (prefer 2; allow 1 if download proves path)
+        if (httpsOk < 1)
         {
-            return (true, ip, "ok");
+            return FailHealth("HTTPS", lastHttpsErr, dnsOk: true, httpsOk: 0, bytes: 0, swAll.Elapsed.TotalMilliseconds);
         }
-        if (successes >= 2 && !IsExactExpectedExit(ip))
+
+        // Exit IP from a second source if needed
+        if (string.IsNullOrWhiteSpace(exitIp))
         {
-            return (false, ip, "Exit IP incomplete/mismatch after HTTPS success");
+            try
+            {
+                exitIp = (await client.GetStringAsync("https://api.ipify.org", ct)).Trim();
+            }
+            catch (Exception ex)
+            {
+                return FailHealth("EXIT_IP", $"Exit IP fetch failed: {ex.Message}", true, httpsOk, 0, swAll.Elapsed.TotalMilliseconds);
+            }
         }
-        return (false, ip, lastErr);
+
+        if (!IsExactExpectedExit(exitIp))
+        {
+            return FailHealth("EXIT_IP", $"Exit IP mismatch got={exitIp} expected={_cred.server_ip}",
+                true, httpsOk, 0, swAll.Elapsed.TotalMilliseconds, exitIp);
+        }
+
+        // 3) Bounded payload download — proves transfer (stall / near-zero throughput fails)
+        // Full connect: ~192 KiB; periodic monitor: ~96 KiB (still requires real transfer)
+        var targetBytes = fullCheck ? 196_608 : 98_304;
+        long got = 0;
+        var swDl = Stopwatch.StartNew();
+        try
+        {
+            using var resp = await client.GetAsync(
+                $"https://speed.cloudflare.com/__down?bytes={targetBytes}",
+                HttpCompletionOption.ResponseHeadersRead,
+                ct);
+            if (!resp.IsSuccessStatusCode)
+            {
+                return FailHealth("DOWNLOAD", $"Download HTTP {(int)resp.StatusCode}", true, httpsOk, 0,
+                    swAll.Elapsed.TotalMilliseconds, exitIp);
+            }
+
+            await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+            var buffer = new byte[16_384];
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(fullCheck ? TimeSpan.FromSeconds(18) : TimeSpan.FromSeconds(12));
+            while (got < targetBytes)
+            {
+                var n = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), timeoutCts.Token);
+                if (n <= 0) break;
+                got += n;
+            }
+            swDl.Stop();
+
+            if (got < targetBytes * 0.85)
+            {
+                return FailHealth("DOWNLOAD_STALL",
+                    $"Download incomplete got={got}/{targetBytes} in {swDl.Elapsed.TotalMilliseconds:F0}ms",
+                    true, httpsOk, got, swAll.Elapsed.TotalMilliseconds, exitIp);
+            }
+
+            var mbps = got * 8.0 / Math.Max(swDl.Elapsed.TotalSeconds, 0.001) / 1_000_000.0;
+            // Usable floor for mobile VPN (not a speed test) — reject near-zero throughput
+            var minMbps = fullCheck ? 0.15 : 0.10;
+            if (mbps < minMbps)
+            {
+                return FailHealth("DOWNLOAD_STALL",
+                    $"Effective throughput too low ({mbps:F3} Mbps) for usable browsing",
+                    true, httpsOk, got, swAll.Elapsed.TotalMilliseconds, exitIp);
+            }
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return FailHealth("DOWNLOAD_STALL",
+                $"Download timed out after {got} bytes",
+                true, httpsOk, got, swAll.Elapsed.TotalMilliseconds, exitIp);
+        }
+        catch (Exception ex)
+        {
+            return FailHealth("DOWNLOAD", ex.Message, true, httpsOk, got, swAll.Elapsed.TotalMilliseconds, exitIp);
+        }
+
+        // 4) IPv6 leak / unusable path note (non-fatal if IPv6 simply fails)
+        var ipv6Note = "no-ipv6-or-unreachable";
+        try
+        {
+            using var v6Client = new HttpClient(new HttpClientHandler { UseProxy = false })
+            {
+                Timeout = TimeSpan.FromSeconds(4)
+            };
+            // If this succeeds with a non-NL address, flag possible leak; NL v6 unlikely on lab
+            var body = await v6Client.GetStringAsync("https://api64.ipify.org", ct);
+            var v6ip = body.Trim();
+            if (!string.IsNullOrWhiteSpace(v6ip) && !IsExactExpectedExit(v6ip) && v6ip.Contains(':'))
+            {
+                ipv6Note = $"possible_ipv6_leak:{v6ip}";
+                _log.Warn($"IPv6 path may bypass tunnel (exit {v6ip}) — IPv4 VPN still required");
+            }
+            else if (IsExactExpectedExit(v6ip))
+            {
+                ipv6Note = "ipv6_via_tunnel_or_mapped";
+            }
+        }
+        catch
+        {
+            ipv6Note = "ipv6_unreachable_ok";
+        }
+
+        swAll.Stop();
+        return new TunHealthResult
+        {
+            Ok = true,
+            ExitIp = exitIp,
+            Detail = "ok",
+            Category = "OK",
+            DnsOk = true,
+            HttpsOk = httpsOk,
+            BytesReceived = got,
+            ElapsedMs = swAll.Elapsed.TotalMilliseconds,
+            Ipv6Note = ipv6Note
+        };
     }
+
+    private static TunHealthResult FailHealth(
+        string category, string detail, bool dnsOk, int httpsOk, long bytes, double elapsed,
+        string? exitIp = null) => new()
+    {
+        Ok = false,
+        Category = category,
+        Detail = detail,
+        DnsOk = dnsOk,
+        HttpsOk = httpsOk,
+        BytesReceived = bytes,
+        ElapsedMs = elapsed,
+        ExitIp = exitIp
+    };
+
+    public static string ClassifyHealthCategory(string msg)
+    {
+        var d = (msg ?? "").ToLowerInvariant();
+        if (d.Contains("[dns]") || d.Contains("dns ")) return "DNS";
+        if (d.Contains("download_stall") || d.Contains("throughput too low") || d.Contains("incomplete"))
+            return "DOWNLOAD_STALL";
+        if (d.Contains("download")) return "DOWNLOAD";
+        if (d.Contains("exit ip")) return "EXIT_IP";
+        if (d.Contains("https")) return "HTTPS";
+        if (d.Contains("route path")) return "ROUTE";
+        return "OTHER";
+    }
+
+    private static bool IsSharedHealthCategory(string? cat) =>
+        cat is "DNS" or "DOWNLOAD_STALL" or "ROUTE";
 
     public async Task<(bool ok, string? exitIp, string detail)> VerifyHealthAsync(CancellationToken ct)
     {
-        if (_tunProcess?.IsRunning != true || !TunInterfaceUp() || !_pathVerified)
+        if (_tunProcess?.IsRunning != true || !TunInterfaceUp() || !_pathVerified || !_usableInternetVerified)
         {
-            return (false, null, "TUN/path not active");
+            return (false, null, "TUN/path/usable-internet not active");
         }
 
         var (pathOk, pathDetail) = VerifyTrafficUsesTun(new[] { "1.1.1.1" });
         if (!pathOk)
         {
             _pathVerified = false;
+            _usableInternetVerified = false;
             return (false, null, pathDetail);
         }
 
-        return await VerifyInternetAsync(ct);
+        // Periodic monitor: lighter but still requires DNS + named HTTPS + smaller payload
+        var health = await VerifyUsableInternetAsync(ct, fullCheck: false);
+        if (!health.Ok)
+        {
+            _usableInternetVerified = false;
+            _lastHealthCategory = health.Category;
+            return (false, health.ExitIp, $"[{health.Category}] {health.Detail}");
+        }
+
+        _usableInternetVerified = true;
+        return (true, health.ExitIp, "ok");
     }
 
     private bool IsExactExpectedExit(string? ip) =>
@@ -429,6 +692,7 @@ public sealed class ConnectionService
     {
         _verifiedConnected = false;
         _pathVerified = false;
+        _usableInternetVerified = false;
         if (_tunProcess != null)
         {
             await _tunProcess.StopAsync();

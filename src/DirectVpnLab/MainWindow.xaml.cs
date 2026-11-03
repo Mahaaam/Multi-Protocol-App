@@ -32,6 +32,8 @@ public partial class MainWindow : Window
     private PersistedLabState? _testAllBaseline;
     private TaskCompletionSource? _activeOpCompletion;
     private DateTime? _connectedSince;
+    private int _healthFailStreak;
+    private bool _userRequestedDisconnect;
 
     public MainWindow()
     {
@@ -170,7 +172,8 @@ public partial class MainWindow : Window
         }
 
         // Cancel in-flight TEST ALL / CONNECT
-        if (_uiState is ConnectionUiState.Testing or ConnectionUiState.Connecting)
+        if (_uiState is ConnectionUiState.Testing or ConnectionUiState.Connecting
+            or ConnectionUiState.Verifying or ConnectionUiState.Switching)
         {
             _log.Warn("Cancel requested");
             _cts?.Cancel();
@@ -223,20 +226,40 @@ public partial class MainWindow : Window
                 return;
             }
 
+            _userRequestedDisconnect = false;
+            _healthFailStreak = 0;
+            var netFp = PersistenceService.CaptureNetworkFingerprint();
+            var blocked = new HashSet<string>(
+                _persist.GetTunFailureIdsForNetwork(_state, netFp),
+                StringComparer.OrdinalIgnoreCase);
+
+            var candidates = passed
+                .Where(m => !blocked.Contains(m.Id))
+                .ToList();
+            if (candidates.Count == 0)
+            {
+                _log.Warn("All PASS methods are temporarily blocked for this network after TUN health failures — clearing blocklist for retry");
+                _persist.ClearTunFailuresForNetwork(_state, netFp);
+                candidates = passed.ToList();
+            }
+            else if (blocked.Count > 0)
+            {
+                _log.Info($"Skipping {blocked.Count} method(s) with recent TUN health failures on this network: {string.Join(",", blocked)}");
+            }
+
             SetUiState(ConnectionUiState.Connecting);
             var discovery = new DiscoveryService(_log, _cred);
             var sw = System.Diagnostics.Stopwatch.StartNew();
             string? lastFail = null;
+            var eligible = new List<ProtocolMethod>();
 
-            // One quick recheck → TUN immediately; only then try next candidate
-            foreach (var m in passed)
+            foreach (var m in candidates)
             {
                 ct.ThrowIfCancellationRequested();
                 _log.Info($"Quick Connect candidate {m.Id} {m.DisplayName}");
                 var (ok, detail) = await discovery.QuickRecheckAsync(m, ct);
                 if (!ok)
                 {
-                    // Keep prior Pass as cached — do not present as live success
                     m.IsHistorical = true;
                     m.LastError = detail;
                     lastFail = $"{m.Id}: {detail}";
@@ -244,54 +267,78 @@ public partial class MainWindow : Window
                     continue;
                 }
 
-                // Only this protocol leaves Cached state after live recheck
                 m.IsHistorical = false;
                 m.LastTestedAtUtc = DateTime.UtcNow;
-                _log.Info($"Recheck OK — starting TUN for {m.Id} ({detail})");
-                var (connOk, msg) = await _connection.ConnectBestAsync(new[] { m }, ct);
-                if (connOk && _connection.IsConnected)
-                {
-                    sw.Stop();
-                    ApplyConnectedUi(_connection.ActiveMethod!, sw.Elapsed);
-                    _state.BestMethodId = m.Id;
-                    _state.LastExitIp = m.ExitIp;
-                    // Environment OK for this session; other methods remain IsHistorical
-                    if (!_state.ResultsStale)
-                    {
-                        _state.StaleReason = null;
-                    }
-                    _state.LastTestIncomplete = false;
-                    _persist.UpsertMethod(_state, m);
-                    foreach (var other in _methods.Where(x => x.Id != m.Id))
-                    {
-                        _persist.UpsertMethod(_state, other);
-                    }
-                    _persist.Save(_state, _cred);
-                    _lastCompleteState = CloneState(_state);
-                    UpdatePersistMeta();
-                    _healthTimer.Start();
-                    _log.Info($"Quick Connect finished in {sw.Elapsed.TotalSeconds:F1}s via {m.Id}");
-                    return;
-                }
-
-                // TUN failed after recheck — revert this method to cached (not live-verified session)
-                m.IsHistorical = true;
-
-                lastFail = msg;
-                _log.Warn($"TUN failed for {m.Id}: {msg}");
-                if (ConnectionService.IsFatalMessage(msg))
-                {
-                    SetUiState(ConnectionUiState.Failed, msg);
-                    _log.Fail(msg);
-                    ClearConnInfo();
-                    return;
-                }
+                eligible.Add(m);
+                _log.Info($"Recheck OK — queued for TUN: {m.Id} ({detail})");
             }
 
+            if (eligible.Count == 0)
+            {
+                SetUiState(ConnectionUiState.Failed, lastFail ?? "No method passed quick recheck");
+                _log.Fail("CONNECTION FAILED — no method passed quick recheck");
+                ClearConnInfo();
+                return;
+            }
+
+            void OnPhase(string phase, string detail)
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    if (phase == "VERIFYING")
+                        SetUiState(ConnectionUiState.Verifying, detail);
+                    else if (phase == "SWITCHING")
+                        SetUiState(ConnectionUiState.Switching, detail);
+                    else if (phase == "CONNECTING")
+                        SetUiState(ConnectionUiState.Connecting, detail);
+                });
+            }
+
+            void OnCandidateFailed(ProtocolMethod failedMethod, string failMsg)
+            {
+                var cat = _connection.LastHealthFailureCategory
+                          ?? ConnectionService.ClassifyHealthCategory(failMsg);
+                _persist.RecordTunFailure(_state, failedMethod.Id, netFp, cat, failMsg);
+                failedMethod.IsHistorical = true;
+                failedMethod.LastError = failMsg;
+                _log.Warn($"Recorded TUN health failure for {failedMethod.Id} [{cat}] on network {netFp}");
+            }
+
+            // ConnectBestAsync runs TUN + real usable-internet check; fails over to next eligible
+            var (connOk, msg) = await _connection.ConnectBestAsync(eligible, ct, OnPhase, OnCandidateFailed);
+            if (connOk && _connection.IsConnected && _connection.UsableInternetVerified)
+            {
+                sw.Stop();
+                var active = _connection.ActiveMethod!;
+                _persist.ClearTunFailure(_state, active.Id, netFp);
+
+                ApplyConnectedUi(active, sw.Elapsed);
+                _state.BestMethodId = active.Id;
+                _state.LastExitIp = active.ExitIp;
+                if (!_state.ResultsStale) _state.StaleReason = null;
+                _state.LastTestIncomplete = false;
+                _persist.UpsertMethod(_state, active);
+                foreach (var other in _methods.Where(x => x.Id != active.Id))
+                {
+                    other.IsHistorical = true;
+                    _persist.UpsertMethod(_state, other);
+                }
+                _persist.Save(_state, _cred);
+                _lastCompleteState = CloneState(_state);
+                UpdatePersistMeta();
+                _healthTimer.Start();
+                _log.Info($"Quick Connect finished in {sw.Elapsed.TotalSeconds:F1}s via {active.Id} (usable internet OK)");
+                return;
+            }
+
+            _persist.Save(_state, _cred);
+            _lastCompleteState = CloneState(_state);
+
             sw.Stop();
-            var failMsg = lastFail ?? "CONNECTION FAILED — no method available";
-            SetUiState(ConnectionUiState.Failed, failMsg);
-            _log.Fail(failMsg);
+            lastFail = msg;
+            _log.Warn($"Connect failed: {msg}");
+            SetUiState(ConnectionUiState.Failed, lastFail ?? "CONNECTION FAILED — no usable VPN path");
+            _log.Fail(lastFail ?? "CONNECTION FAILED — no usable VPN path");
             ClearConnInfo();
         }
         catch (OperationCanceledException)
@@ -359,13 +406,18 @@ public partial class MainWindow : Window
             _state.BestMethodId,
             resultsStale: _state.ResultsStale,
             staleReason: _state.StaleReason,
-            lastTestIncomplete: _state.LastTestIncomplete);
+            lastTestIncomplete: _state.LastTestIncomplete,
+            tunFailures: _state.TunFailures);
         _testAllBaseline.Ui = CloneUi(_state.Ui);
         try
         {
             var discovery = new DiscoveryService(_log, _cred);
             await discovery.RunAsync(_methods.ToList(), new Progress<ProtocolMethod>(_ => RefreshGrids()), _cts.Token);
             RefreshGrids();
+
+            // Fresh ranking re-validates; clear network TUN health blocks so discovery Pass can be tried again
+            var fp = PersistenceService.CaptureNetworkFingerprint();
+            _persist.ClearTunFailuresForNetwork(_state, fp);
 
             _state = _persist.CaptureFromMethods(
                 _methods,
@@ -374,7 +426,8 @@ public partial class MainWindow : Window
                 _methods.Where(m => m.Status == TestStatus.Pass).OrderBy(m => m.Rank).FirstOrDefault()?.Id,
                 resultsStale: false,
                 staleReason: null,
-                lastTestIncomplete: false);
+                lastTestIncomplete: false,
+                tunFailures: _state.TunFailures);
             _state.Ui = CloneUi(_lastCompleteState.Ui);
             _state.Ui.AutoScrollLog = ChkAutoScroll.IsChecked == true;
             _persist.Save(_state, _cred);
@@ -432,15 +485,24 @@ public partial class MainWindow : Window
             }
             else
             {
-                if (!_connection.TunnelPathVerified)
+                if (!_connection.TunnelPathVerified || !_connection.UsableInternetVerified || !_connection.IsConnected)
                 {
-                    _log.Warn("VPN Speed Test blocked — tunnel path not verified");
-                    TxtSpeedVpn.Text = "VPN: BLOCKED — tunnel path not verified";
+                    _log.Warn("VPN Speed Test blocked — usable TUN internet not verified");
+                    TxtSpeedVpn.Text = "VPN: BLOCKED — usable internet not verified";
                     return;
                 }
 
+                var health = await _connection.VerifyHealthAsync(CancellationToken.None);
+                if (!health.ok || !string.Equals(health.exitIp, _cred.server_ip, StringComparison.Ordinal))
+                {
+                    _log.Warn($"VPN Speed Test blocked — health/exit IP check failed: {health.detail}");
+                    TxtSpeedVpn.Text = $"VPN: BLOCKED — {health.detail}";
+                    return;
+                }
+
+                using var speedCts = new CancellationTokenSource(TimeSpan.FromSeconds(90));
                 var p = _connection.ActiveMethod;
-                _vpnSpeed = await _speed.RunAsync("VPN", p?.DisplayName, null, CancellationToken.None);
+                _vpnSpeed = await _speed.RunAsync("VPN", p?.DisplayName, null, speedCts.Token);
                 TxtSpeedVpn.Text = FormatSpeed($"VPN ({p?.Protocol})", _vpnSpeed);
             }
         }
@@ -466,9 +528,11 @@ public partial class MainWindow : Window
 
     private async void Disconnect_Click(object sender, RoutedEventArgs e)
     {
-        if (_uiState is ConnectionUiState.Testing or ConnectionUiState.Connecting)
+        if (_uiState is ConnectionUiState.Testing or ConnectionUiState.Connecting
+            or ConnectionUiState.Verifying or ConnectionUiState.Switching)
         {
             _log.Warn("Cancel requested");
+            _userRequestedDisconnect = true;
             _cts?.Cancel();
             return;
         }
@@ -479,6 +543,8 @@ public partial class MainWindow : Window
     private async Task DoDisconnectAsync()
     {
         if (!TryBeginOp()) return;
+        _userRequestedDisconnect = true;
+        _healthFailStreak = 0;
         _healthTimer.Stop();
         _durationTimer.Stop();
         _cts?.Cancel();
@@ -504,6 +570,7 @@ public partial class MainWindow : Window
 
     private async Task HealthTickAsync()
     {
+        if (_userRequestedDisconnect) return;
         if (Interlocked.CompareExchange(ref _healthGate, 1, 0) != 0) return;
 
         try
@@ -519,12 +586,37 @@ public partial class MainWindow : Window
             }
 
             var (ok, exitIp, detail) = await _connection.VerifyHealthAsync(CancellationToken.None);
-            if (ok) return;
+            if (ok)
+            {
+                _healthFailStreak = 0;
+                return;
+            }
 
-            _log.Warn($"Health check failed: {detail}");
-            SetUiState(ConnectionUiState.Degraded);
+            _healthFailStreak++;
+            _log.Warn($"Health check failed ({_healthFailStreak}): {detail}");
+            SetUiState(ConnectionUiState.Degraded, detail);
 
-            var ranked = _methods.Where(m => m.Status == TestStatus.Pass).OrderBy(m => m.Rank).ToList();
+            // Require two consecutive failures — ignore a single transient timeout
+            if (_healthFailStreak < 2) return;
+            if (_userRequestedDisconnect) return;
+
+            var failedId = _connection.ActiveMethod?.Id;
+            var netFp = PersistenceService.CaptureNetworkFingerprint();
+            if (!string.IsNullOrEmpty(failedId))
+            {
+                _persist.RecordTunFailure(_state, failedId, netFp,
+                    _connection.LastHealthFailureCategory ?? ConnectionService.ClassifyHealthCategory(detail),
+                    detail);
+            }
+
+            SetUiState(ConnectionUiState.Switching, "Switching after sustained health failure");
+            var ranked = _methods
+                .Where(m => m.Status == TestStatus.Pass)
+                .Where(m => failedId == null || !string.Equals(m.Id, failedId, StringComparison.OrdinalIgnoreCase))
+                .Where(m => !_persist.GetTunFailureIdsForNetwork(_state, netFp).Contains(m.Id, StringComparer.OrdinalIgnoreCase))
+                .OrderBy(m => m.Rank)
+                .ToList();
+
             var (discOk, discMsg) = await _connection.DisconnectAsync();
             if (!discOk)
             {
@@ -534,40 +626,40 @@ public partial class MainWindow : Window
                 return;
             }
 
+            if (_userRequestedDisconnect) return;
+
             var discovery = new DiscoveryService(_log, _cred);
-            var recovered = false;
-            string? lastMsg = null;
+            var eligible = new List<ProtocolMethod>();
             foreach (var m in ranked)
             {
-                var (rOk, recheckDetail) = await discovery.QuickRecheckAsync(m, CancellationToken.None);
-                if (!rOk)
-                {
-                    lastMsg = recheckDetail;
-                    continue;
-                }
-
-                var (reOk, msg) = await _connection.ConnectBestAsync(new[] { m }, CancellationToken.None);
-                lastMsg = msg;
-                if (reOk && _connection.IsConnected)
-                {
-                    var a = _connection.ActiveMethod!;
-                    ApplyConnectedUi(a, TimeSpan.Zero);
-                    TxtExitIp.Text = $"Exit IP: {a.ExitIp ?? exitIp ?? "—"}";
-                    recovered = true;
-                    break;
-                }
-
-                if (ConnectionService.IsFatalMessage(msg))
-                {
-                    break;
-                }
+                var (rOk, _) = await discovery.QuickRecheckAsync(m, CancellationToken.None);
+                if (rOk) eligible.Add(m);
             }
 
-            if (!recovered)
+            void OnPhase(string phase, string d)
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    if (phase == "VERIFYING") SetUiState(ConnectionUiState.Verifying, d);
+                    else if (phase == "SWITCHING") SetUiState(ConnectionUiState.Switching, d);
+                });
+            }
+
+            var (reOk, msg) = await _connection.ConnectBestAsync(eligible, CancellationToken.None, OnPhase);
+            if (reOk && _connection.IsConnected && _connection.UsableInternetVerified)
+            {
+                _healthFailStreak = 0;
+                var a = _connection.ActiveMethod!;
+                _persist.ClearTunFailure(_state, a.Id, netFp);
+                ApplyConnectedUi(a, TimeSpan.Zero);
+                TxtExitIp.Text = $"Exit IP: {a.ExitIp ?? exitIp ?? "—"}";
+                _persist.Save(_state, _cred);
+            }
+            else
             {
                 ClearConnInfo();
-                SetUiState(ConnectionUiState.Failed, lastMsg ?? "Recovery failed");
-                _log.Fail(lastMsg ?? "Recovery failed");
+                SetUiState(ConnectionUiState.Failed, msg);
+                _log.Fail(msg);
             }
         }
         finally
@@ -645,7 +737,8 @@ public partial class MainWindow : Window
             _state.BestMethodId ?? _methods.Where(m => m.Status == TestStatus.Pass).OrderBy(m => m.Rank).FirstOrDefault()?.Id,
             resultsStale: _state.ResultsStale,
             staleReason: _state.StaleReason,
-            lastTestIncomplete: false);
+            lastTestIncomplete: false,
+            tunFailures: _state.TunFailures);
         _state.Ui = ui;
         _persist.Save(_state, _cred);
         _lastCompleteState = CloneState(_state);
@@ -726,6 +819,14 @@ public partial class MainWindow : Window
         StaleReason = src.StaleReason,
         LastTestIncomplete = src.LastTestIncomplete,
         Ui = CloneUi(src.Ui),
+        TunFailures = src.TunFailures.Select(f => new TunFailureRecord
+        {
+            MethodId = f.MethodId,
+            NetworkFingerprint = f.NetworkFingerprint,
+            ReasonCategory = f.ReasonCategory,
+            Detail = f.Detail,
+            FailedAtUtc = f.FailedAtUtc
+        }).ToList(),
         Methods = src.Methods.Select(m => new PersistedMethodResult
         {
             Id = m.Id,
@@ -819,7 +920,8 @@ public partial class MainWindow : Window
     private void SetBusy(bool busy)
     {
         var vpnActive = _connection.IsConnected || _uiState == ConnectionUiState.Connected;
-        var cancellable = _uiState is ConnectionUiState.Testing or ConnectionUiState.Connecting;
+        var cancellable = _uiState is ConnectionUiState.Testing or ConnectionUiState.Connecting
+            or ConnectionUiState.Verifying or ConnectionUiState.Switching;
         var op = busy || cancellable || _uiState == ConnectionUiState.Degraded;
         BtnTestAll.IsEnabled = (!op && !vpnActive) || cancellable;
         BtnSpeed.IsEnabled = !busy && !cancellable;
@@ -838,19 +940,24 @@ public partial class MainWindow : Window
             ConnectionUiState.Disconnected => "DISCONNECTED",
             ConnectionUiState.Testing => "TESTING",
             ConnectionUiState.Connecting => "CONNECTING",
+            ConnectionUiState.Verifying => "VERIFYING",
             ConnectionUiState.Connected => "CONNECTED",
-            ConnectionUiState.Degraded => "RECOVERING",
+            ConnectionUiState.Degraded => "DEGRADED",
+            ConnectionUiState.Switching => "SWITCHING",
             ConnectionUiState.Failed => "FAILED",
             _ => state.ToString()
         };
-        TxtStatus.Text = string.IsNullOrWhiteSpace(detail) || state != ConnectionUiState.Failed
+        TxtStatus.Text = string.IsNullOrWhiteSpace(detail) ||
+                         state is not (ConnectionUiState.Failed or ConnectionUiState.Verifying or ConnectionUiState.Switching or ConnectionUiState.Degraded)
             ? label
-            : Truncate(detail, 72);
+            : Truncate($"{label}: {detail}", 78);
         TxtConnStatus.Text = $"Status: {label}";
 
         var vpnActive = state == ConnectionUiState.Connected || _connection.IsConnected;
-        var cancellable = state is ConnectionUiState.Testing or ConnectionUiState.Connecting;
-        BtnTestAll.IsEnabled = (!vpnActive && state is not (ConnectionUiState.Connecting or ConnectionUiState.Degraded)) || state == ConnectionUiState.Testing;
+        var cancellable = state is ConnectionUiState.Testing or ConnectionUiState.Connecting
+            or ConnectionUiState.Verifying or ConnectionUiState.Switching;
+        BtnTestAll.IsEnabled = (!vpnActive && state is not (ConnectionUiState.Connecting or ConnectionUiState.Verifying
+            or ConnectionUiState.Switching or ConnectionUiState.Degraded)) || state == ConnectionUiState.Testing;
         BtnDisconnect.IsEnabled = cancellable || state is ConnectionUiState.Connected or ConnectionUiState.Degraded;
         BtnDisconnect.Content = cancellable ? "CANCEL" : "DISCONNECT";
         BtnConnectTop.Content = "CONNECT";
@@ -859,6 +966,8 @@ public partial class MainWindow : Window
         {
             ConnectionUiState.Connected => ("#2ECC71", "#143022"),
             ConnectionUiState.Connecting => ("#E6B450", "#2A2415"),
+            ConnectionUiState.Verifying => ("#3DB9F5", "#15202A"),
+            ConnectionUiState.Switching => ("#E6B450", "#2A2415"),
             ConnectionUiState.Testing => ("#3DB9F5", "#15202A"),
             ConnectionUiState.Degraded => ("#E6B450", "#2A2415"),
             ConnectionUiState.Failed => ("#E85D5D", "#2A1515"),
