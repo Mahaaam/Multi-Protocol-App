@@ -154,7 +154,9 @@ public sealed class ConnectionService
         return null;
     }
 
-    private static bool IsFatalConnectError(string msg)
+    private static bool IsFatalConnectError(string msg) => IsFatalMessage(msg);
+
+    public static bool IsFatalMessage(string msg)
     {
         var d = msg.ToLowerInvariant();
         return d.Contains("administrator") ||

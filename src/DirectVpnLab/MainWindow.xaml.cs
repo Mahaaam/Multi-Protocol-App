@@ -138,7 +138,27 @@ public partial class MainWindow : Window
             return;
         }
 
+        // Cancel in-flight TEST ALL / CONNECT
+        if (_uiState is ConnectionUiState.Testing or ConnectionUiState.Connecting)
+        {
+            _log.Warn("Cancel requested");
+            _cts?.Cancel();
+            return;
+        }
+
         if (!TryBeginOp()) return;
+
+        // Re-evaluate network freshness before Quick Connect (Wi-Fi/Hotspot/server/engine)
+        _state = _persist.LoadOrCreate(_cred);
+        if (_state.ResultsStale)
+        {
+            _log.Warn($"Cached ranking stale: {_state.StaleReason}");
+            foreach (var m in _methods.Where(x => x.Status == TestStatus.Pass))
+            {
+                m.IsHistorical = true;
+            }
+            RefreshGrids();
+        }
 
         var fatal = _connection.CheckFatalPrerequisites();
         if (fatal != null)
@@ -155,10 +175,11 @@ public partial class MainWindow : Window
         SetBusy(true);
         try
         {
-            // CONNECT uses prior PASS ranking — does NOT run full TEST ALL
+            // Quick Connect: cached PASS only — never runs full TEST ALL
             var passed = _methods
                 .Where(m => m.Status == TestStatus.Pass)
-                .OrderBy(m => m.Rank == 0 ? int.MaxValue : m.Rank)
+                .OrderBy(m => m.Id == _state.BestMethodId ? 0 : 1)
+                .ThenBy(m => m.Rank == 0 ? int.MaxValue : m.Rank)
                 .ThenByDescending(m => m.QualityScore)
                 .ToList();
 
@@ -169,71 +190,63 @@ public partial class MainWindow : Window
                 return;
             }
 
-            if (_state.ResultsStale)
-            {
-                _log.Warn($"Using stale cached ranking ({_state.StaleReason}) — quick recheck required before TUN");
-            }
-
             SetUiState(ConnectionUiState.Connecting);
             var discovery = new DiscoveryService(_log, _cred);
-            var eligible = new List<ProtocolMethod>();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            string? lastFail = null;
 
+            // One quick recheck → TUN immediately; only then try next candidate
             foreach (var m in passed)
             {
                 ct.ThrowIfCancellationRequested();
+                _log.Info($"Quick Connect candidate {m.Id} {m.DisplayName}");
                 var (ok, detail) = await discovery.QuickRecheckAsync(m, ct);
-                if (ok)
+                if (!ok)
                 {
-                    m.IsHistorical = false;
-                    eligible.Add(m);
-                    _log.Info($"Eligible for TUN: {m.Id} ({detail})");
+                    lastFail = $"{m.Id}: {detail}";
+                    _log.Warn($"Quick recheck failed — trying next: {lastFail}");
+                    continue;
                 }
-                else
+
+                m.IsHistorical = false;
+                _log.Info($"Recheck OK — starting TUN for {m.Id} ({detail})");
+                var (connOk, msg) = await _connection.ConnectBestAsync(new[] { m }, ct);
+                if (connOk && _connection.IsConnected)
                 {
-                    _log.Warn($"Quick recheck failed for {m.Id}: {detail}");
-                    m.LastError = detail;
+                    sw.Stop();
+                    ApplyConnectedUi(_connection.ActiveMethod!, sw.Elapsed);
+                    _state.BestMethodId = m.Id;
+                    _state.LastExitIp = m.ExitIp;
+                    _state.ResultsStale = false;
+                    _state.StaleReason = null;
+                    SaveResultsSnapshot();
+                    _healthTimer.Start();
+                    _log.Info($"Quick Connect finished in {sw.Elapsed.TotalSeconds:F1}s via {m.Id}");
+                    return;
+                }
+
+                lastFail = msg;
+                _log.Warn($"TUN failed for {m.Id}: {msg}");
+                if (ConnectionService.IsFatalMessage(msg))
+                {
+                    SetUiState(ConnectionUiState.Failed, msg);
+                    _log.Fail(msg);
+                    ClearConnInfo();
+                    return;
                 }
             }
 
-            if (eligible.Count == 0)
-            {
-                SetUiState(ConnectionUiState.Failed, "No method passed quick recheck");
-                _log.Fail("CONNECTION FAILED — no method available after quick recheck");
-                return;
-            }
-
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            var (connOk, msg) = await _connection.ConnectBestAsync(eligible, ct);
             sw.Stop();
-            if (!connOk || !_connection.IsConnected)
-            {
-                SetUiState(ConnectionUiState.Failed, msg);
-                _log.Fail(msg);
-                ClearConnInfo();
-                return;
-            }
-
-            var active = _connection.ActiveMethod!;
-            TxtProtocol.Text = $"Method: {active.Id} {active.DisplayName}";
-            TxtTransport.Text = $"Transport: {active.Transport}";
-            TxtExitIp.Text = $"Exit IP: {active.ExitIp ?? "—"}";
-            TxtLatency.Text = $"Latency: {active.LatencyMs:F0} ms";
-            TxtConnStatus.Text = "Status: Connected";
-            _connectedSince = DateTime.Now;
-            UpdateDuration();
-            _durationTimer.Start();
-            _state.BestMethodId = active.Id;
-            _state.LastExitIp = active.ExitIp;
-            _state.ResultsStale = false;
-            _state.StaleReason = null;
-            SaveResultsSnapshot();
-            SetUiState(ConnectionUiState.Connected);
-            _healthTimer.Start();
-            _log.Info($"Connect duration setup: {sw.Elapsed.TotalSeconds:F1}s");
+            var failMsg = lastFail ?? "CONNECTION FAILED — no method available";
+            SetUiState(ConnectionUiState.Failed, failMsg);
+            _log.Fail(failMsg);
+            ClearConnInfo();
         }
         catch (OperationCanceledException)
         {
-            _log.Warn("Operation cancelled");
+            _log.Warn("Quick Connect cancelled — cleaning up");
+            try { await _connection.DisconnectAsync(); } catch { /* ignore */ }
+            ClearConnInfo();
             SetUiState(ConnectionUiState.Disconnected);
         }
         catch (Exception ex)
@@ -248,11 +261,32 @@ public partial class MainWindow : Window
         }
     }
 
+    private void ApplyConnectedUi(ProtocolMethod active, TimeSpan setup)
+    {
+        TxtProtocol.Text = $"Method: {active.Id} {active.DisplayName}";
+        TxtTransport.Text = $"Transport: {active.Transport}";
+        TxtExitIp.Text = $"Exit IP: {active.ExitIp ?? "—"}";
+        TxtLatency.Text = $"Latency: {active.LatencyMs:F0} ms";
+        TxtConnStatus.Text = "Status: Connected";
+        _connectedSince = DateTime.Now;
+        UpdateDuration();
+        _durationTimer.Start();
+        SetUiState(ConnectionUiState.Connected);
+        _ = setup;
+    }
+
     private async void TestAll_Click(object sender, RoutedEventArgs e)
     {
         if (_connection.IsConnected || _uiState == ConnectionUiState.Connected)
         {
             _log.Warn("TEST ALL disabled while VPN Connected");
+            return;
+        }
+
+        if (_uiState is ConnectionUiState.Testing or ConnectionUiState.Connecting)
+        {
+            _log.Warn("Cancel requested");
+            _cts?.Cancel();
             return;
         }
 
@@ -262,14 +296,11 @@ public partial class MainWindow : Window
         _cts = new CancellationTokenSource();
         SetBusy(true);
         SetUiState(ConnectionUiState.Testing);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             foreach (var m in _methods)
             {
-                if (m.Status != TestStatus.Skipped || m.Id is not ("F01" or "F02"))
-                {
-                    // reset non-MASQUE for fresh run; MASQUE stays skipped
-                }
                 m.IsHistorical = false;
             }
 
@@ -284,8 +315,16 @@ public partial class MainWindow : Window
                 _methods.Where(m => m.Status == TestStatus.Pass).OrderBy(m => m.Rank).FirstOrDefault()?.Id);
             _persist.Save(_state, _cred);
             UpdatePersistMeta();
+            sw.Stop();
             SetUiState(ConnectionUiState.Disconnected);
-            _log.Info("TEST ALL finished — results saved locally");
+            _log.Info($"TEST ALL finished in {sw.Elapsed.TotalSeconds:F1}s — results saved locally");
+        }
+        catch (OperationCanceledException)
+        {
+            _log.Warn("TEST ALL cancelled — partial results kept where available");
+            RefreshGrids();
+            SaveResultsSnapshot();
+            SetUiState(ConnectionUiState.Disconnected);
         }
         catch (Exception ex)
         {
@@ -344,7 +383,17 @@ public partial class MainWindow : Window
         return $"{label}: ↓ {r.DownloadMbps:F2} Mbps  ↑ {r.UploadMbps:F2} Mbps  lat {r.LatencyMs:F0} ms";
     }
 
-    private async void Disconnect_Click(object sender, RoutedEventArgs e) => await DoDisconnectAsync();
+    private async void Disconnect_Click(object sender, RoutedEventArgs e)
+    {
+        if (_uiState is ConnectionUiState.Testing or ConnectionUiState.Connecting)
+        {
+            _log.Warn("Cancel requested");
+            _cts?.Cancel();
+            return;
+        }
+
+        await DoDisconnectAsync();
+    }
 
     private async Task DoDisconnectAsync()
     {
@@ -405,29 +454,39 @@ public partial class MainWindow : Window
             }
 
             var discovery = new DiscoveryService(_log, _cred);
-            var eligible = new List<ProtocolMethod>();
+            var recovered = false;
+            string? lastMsg = null;
             foreach (var m in ranked)
             {
-                var (rOk, _) = await discovery.QuickRecheckAsync(m, CancellationToken.None);
-                if (rOk) eligible.Add(m);
+                var (rOk, recheckDetail) = await discovery.QuickRecheckAsync(m, CancellationToken.None);
+                if (!rOk)
+                {
+                    lastMsg = recheckDetail;
+                    continue;
+                }
+
+                var (reOk, msg) = await _connection.ConnectBestAsync(new[] { m }, CancellationToken.None);
+                lastMsg = msg;
+                if (reOk && _connection.IsConnected)
+                {
+                    var a = _connection.ActiveMethod!;
+                    ApplyConnectedUi(a, TimeSpan.Zero);
+                    TxtExitIp.Text = $"Exit IP: {a.ExitIp ?? exitIp ?? "—"}";
+                    recovered = true;
+                    break;
+                }
+
+                if (ConnectionService.IsFatalMessage(msg))
+                {
+                    break;
+                }
             }
 
-            var (reOk, msg) = await _connection.ConnectBestAsync(eligible, CancellationToken.None);
-            if (reOk && _connection.IsConnected)
-            {
-                SetUiState(ConnectionUiState.Connected);
-                var a = _connection.ActiveMethod!;
-                TxtProtocol.Text = $"Method: {a.Id} {a.DisplayName}";
-                TxtExitIp.Text = $"Exit IP: {a.ExitIp ?? exitIp ?? "—"}";
-                TxtConnStatus.Text = "Status: Connected";
-                _connectedSince = DateTime.Now;
-                _durationTimer.Start();
-            }
-            else
+            if (!recovered)
             {
                 ClearConnInfo();
-                SetUiState(ConnectionUiState.Failed, msg);
-                _log.Fail(msg);
+                SetUiState(ConnectionUiState.Failed, lastMsg ?? "Recovery failed");
+                _log.Fail(lastMsg ?? "Recovery failed");
             }
         }
         finally
@@ -548,12 +607,15 @@ public partial class MainWindow : Window
     private void SetBusy(bool busy)
     {
         var vpnActive = _connection.IsConnected || _uiState == ConnectionUiState.Connected;
-        var op = busy || _uiState is ConnectionUiState.Testing or ConnectionUiState.Connecting or ConnectionUiState.Degraded;
-        BtnTestAll.IsEnabled = !op && !vpnActive;
-        BtnSpeed.IsEnabled = !busy;
-        BtnConnectTop.IsEnabled = !busy || _uiState == ConnectionUiState.Connected;
+        var cancellable = _uiState is ConnectionUiState.Testing or ConnectionUiState.Connecting;
+        var op = busy || cancellable || _uiState == ConnectionUiState.Degraded;
+        BtnTestAll.IsEnabled = (!op && !vpnActive) || cancellable;
+        BtnSpeed.IsEnabled = !busy && !cancellable;
+        BtnConnectTop.IsEnabled = (!busy || _uiState == ConnectionUiState.Connected) || cancellable;
         BtnConnect.IsEnabled = BtnConnectTop.IsEnabled;
-        BtnDisconnect.IsEnabled = !busy && _uiState is ConnectionUiState.Connected or ConnectionUiState.Degraded;
+        BtnDisconnect.IsEnabled = cancellable ||
+                                  (!busy && _uiState is ConnectionUiState.Connected or ConnectionUiState.Degraded);
+        BtnDisconnect.Content = cancellable ? "CANCEL" : "DISCONNECT";
     }
 
     private void SetUiState(ConnectionUiState state, string? detail = null)
@@ -575,8 +637,10 @@ public partial class MainWindow : Window
         TxtConnStatus.Text = $"Status: {label}";
 
         var vpnActive = state == ConnectionUiState.Connected || _connection.IsConnected;
-        BtnTestAll.IsEnabled = !vpnActive && state is not (ConnectionUiState.Testing or ConnectionUiState.Connecting or ConnectionUiState.Degraded);
-        BtnDisconnect.IsEnabled = state is ConnectionUiState.Connected or ConnectionUiState.Degraded;
+        var cancellable = state is ConnectionUiState.Testing or ConnectionUiState.Connecting;
+        BtnTestAll.IsEnabled = (!vpnActive && state is not (ConnectionUiState.Connecting or ConnectionUiState.Degraded)) || state == ConnectionUiState.Testing;
+        BtnDisconnect.IsEnabled = cancellable || state is ConnectionUiState.Connected or ConnectionUiState.Degraded;
+        BtnDisconnect.Content = cancellable ? "CANCEL" : "DISCONNECT";
         BtnConnectTop.Content = "CONNECT";
 
         var (fg, bg) = state switch

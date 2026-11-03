@@ -35,6 +35,8 @@ public sealed class PersistedMethodResult
     public string? LastError { get; set; }
     public string? SkipReason { get; set; }
     public DateTime? TestedAtUtc { get; set; }
+    public int ProbeAttempts { get; set; }
+    public int ProbeSuccesses { get; set; }
 }
 
 public sealed class UiPrefs
@@ -138,6 +140,8 @@ public sealed class PersistenceService
                 m.SkipReason = p.SkipReason;
             }
             m.LastTestedAtUtc = p.TestedAtUtc;
+            m.ProbeAttempts = p.ProbeAttempts;
+            m.ProbeSuccesses = p.ProbeSuccesses;
         }
 
         if (state.ResultsStale)
@@ -179,7 +183,9 @@ public sealed class PersistenceService
                 ExitIp = m.ExitIp,
                 LastError = m.LastError,
                 SkipReason = m.SkipReason,
-                TestedAtUtc = m.LastTestedAtUtc ?? lastTestAtUtc
+                TestedAtUtc = m.LastTestedAtUtc ?? lastTestAtUtc,
+                ProbeAttempts = m.ProbeAttempts,
+                ProbeSuccesses = m.ProbeSuccesses
             }).ToList()
         };
         return state;

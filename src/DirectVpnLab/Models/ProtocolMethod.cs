@@ -41,6 +41,8 @@ public sealed class ProtocolMethod
     public DateTime? LastTestedAtUtc { get; set; }
     public bool IsHistorical { get; set; }
     public FailureKind FailureKind { get; set; } = FailureKind.None;
+    public int ProbeAttempts { get; set; }
+    public int ProbeSuccesses { get; set; }
 
     public string DisplayName => $"{Protocol} + {Transport}";
     public string StatusLabel => Status switch

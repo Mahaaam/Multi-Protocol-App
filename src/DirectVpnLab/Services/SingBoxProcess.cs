@@ -29,9 +29,10 @@ public sealed partial class SingBoxProcess : IAsyncDisposable
         }
     }
 
-    public async Task StartAsync(string configPath, CancellationToken ct = default)
+    public async Task StartAsync(string configPath, CancellationToken ct = default, int readyDelayMs = 700)
     {
         await StopAsync();
+        lock (_stderr) _stderr.Clear();
         if (!File.Exists(AppPaths.SingBoxExe))
         {
             throw new FileNotFoundException("sing-box.exe not found", AppPaths.SingBoxExe);
@@ -87,7 +88,21 @@ public sealed partial class SingBoxProcess : IAsyncDisposable
         _process.BeginOutputReadLine();
         _process.BeginErrorReadLine();
 
-        await Task.Delay(700, ct);
+        // Poll for early exit instead of always waiting the full delay
+        var delay = Math.Clamp(readyDelayMs, 80, 2000);
+        var waited = 0;
+        while (waited < delay)
+        {
+            ct.ThrowIfCancellationRequested();
+            var slice = Math.Min(60, delay - waited);
+            await Task.Delay(slice, ct);
+            waited += slice;
+            if (_process.HasExited)
+            {
+                throw new InvalidOperationException($"sing-box exited early code={_process.ExitCode}. {StderrSnapshot}");
+            }
+        }
+
         if (_process.HasExited)
         {
             throw new InvalidOperationException($"sing-box exited early code={_process.ExitCode}. {StderrSnapshot}");

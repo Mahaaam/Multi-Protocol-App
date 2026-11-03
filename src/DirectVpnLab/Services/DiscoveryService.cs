@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http;
@@ -8,8 +9,11 @@ namespace DirectVpnLab.Services;
 
 public sealed class DiscoveryService
 {
+    public const int MaxParallel = 3;
+
     private readonly LiveLogService _log;
     private readonly LabCredentials _cred;
+    private readonly ConcurrentDictionary<string, double> _recentLatencyMs = new(StringComparer.OrdinalIgnoreCase);
 
     public DiscoveryService(LiveLogService log, LabCredentials cred)
     {
@@ -22,56 +26,67 @@ public sealed class DiscoveryService
         IProgress<ProtocolMethod>? progress,
         CancellationToken ct)
     {
-        _log.Info("Starting protocol discovery (TEST ALL)");
+        var swAll = Stopwatch.StartNew();
+        _log.Info("Starting protocol discovery (TEST ALL) — parallel up to 3");
         _log.Info("Windows default route will NOT be modified during discovery");
 
         EnsureNaiveDependency(methods);
 
+        // Instant classification for unsupported / missing deps (no network wait)
+        var runnable = new List<ProtocolMethod>();
         foreach (var m in methods)
         {
             ct.ThrowIfCancellationRequested();
             m.IsHistorical = false;
+            m.ProbeAttempts = 0;
+            m.ProbeSuccesses = 0;
 
-            if (m.Id is "F01" or "F02")
+            if (TryMarkNonRunnable(m))
             {
-                m.Status = TestStatus.Skipped;
-                m.FailureKind = FailureKind.Unsupported;
-                m.SkipReason ??= "Unsupported: MASQUE requires sing-box >= 1.15.0 (engine is 1.14.4)";
-                m.LastTestedAtUtc = DateTime.UtcNow;
-                _log.Warn($"SKIPPED - {m.Id} {m.DisplayName}: {m.SkipReason}");
                 progress?.Report(m);
                 continue;
             }
 
-            if (m.IsSkipped)
-            {
-                m.Status = TestStatus.Skipped;
-                m.FailureKind = FailureKind.Unsupported;
-                m.LastTestedAtUtc = DateTime.UtcNow;
-                _log.Warn($"SKIPPED - {m.Id} {m.DisplayName}: {m.SkipReason}");
-                progress?.Report(m);
-                continue;
-            }
+            runnable.Add(m);
+        }
 
-            if ((m.Id is "D01" or "D02") && !File.Exists(AppPaths.LibCronetDll))
-            {
-                m.Status = TestStatus.Skipped;
-                m.FailureKind = FailureKind.DependencyMissing;
-                m.SkipReason = "Dependency missing: libcronet.dll (NaiveProxy)";
-                m.LastError = m.SkipReason;
-                m.LastTestedAtUtc = DateTime.UtcNow;
-                _log.Warn($"SKIPPED - {m.Id}: {m.SkipReason}");
-                progress?.Report(m);
-                continue;
-            }
+        // Prefer previously fast / PASS methods first so parallel slots fill useful work sooner
+        runnable = runnable
+            .OrderByDescending(m => m.Status == TestStatus.Pass)
+            .ThenBy(m => m.LatencyMs <= 0 ? 9_999 : m.LatencyMs)
+            .ThenBy(m => m.Id)
+            .ToList();
 
-            await TestProxyMethodAsync(m, ct);
-            progress?.Report(m);
+        using var gate = new SemaphoreSlim(MaxParallel, MaxParallel);
+        var tasks = runnable.Select(async m =>
+        {
+            await gate.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                ct.ThrowIfCancellationRequested();
+                await TestProxyMethodAsync(m, ct).ConfigureAwait(false);
+                progress?.Report(m);
+            }
+            finally
+            {
+                gate.Release();
+            }
+        });
+
+        try
+        {
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            _log.Warn("TEST ALL cancelled — cleaning temporary discovery processes");
+            throw;
         }
 
         Rank(methods);
         var passed = methods.Where(x => x.Status == TestStatus.Pass).OrderBy(x => x.Rank).ToList();
-        _log.Info($"Ranking complete. Successful methods: {passed.Count}");
+        swAll.Stop();
+        _log.Info($"Ranking complete. Successful methods: {passed.Count} in {swAll.Elapsed.TotalSeconds:F1}s");
         if (passed.Count > 0)
         {
             _log.Info($"Best candidate: {passed[0].Id} {passed[0].DisplayName}");
@@ -79,61 +94,56 @@ public sealed class DiscoveryService
         return methods;
     }
 
-    /// <summary>Short live recheck for CONNECT — does not re-rank all protocols.</summary>
+    /// <summary>Single live probe for Quick Connect — no full re-test of all methods.</summary>
     public async Task<(bool ok, string detail)> QuickRecheckAsync(ProtocolMethod m, CancellationToken ct)
     {
-        if (m.Id is "F01" or "F02")
+        if (TryMarkNonRunnable(m, reportLog: false))
         {
-            return (false, "Unsupported protocol");
+            return (false, m.LastError ?? m.SkipReason ?? "not runnable");
         }
 
-        if ((m.Id is "D01" or "D02") && !File.Exists(AppPaths.LibCronetDll))
-        {
-            return (false, "libcronet.dll missing");
-        }
-
-        _log.Info($"Quick recheck {m.Id} {m.DisplayName}");
+        _log.Info($"Quick recheck {m.Id} {m.DisplayName} (1 probe)");
         var port = FreeTcpPort();
         string? cfg = null;
         await using var sb = new SingBoxProcess(_log);
         try
         {
             cfg = ConfigFactory.BuildDiscoveryConfig(_cred, m, port, AppPaths.WorkDir);
-            await sb.StartAsync(cfg, ct);
-
-            var ok = 0;
-            string? lastErr = null;
-            string? ip = null;
-            for (var i = 0; i < 2; i++)
+            var pre = await PreflightConfigAsync(cfg, ct).ConfigureAwait(false);
+            if (!pre.ok)
             {
-                ct.ThrowIfCancellationRequested();
-                var (success, _, exitIp, err) = await ProbeViaProxyAsync(port, ct);
-                if (success && IsExactExpectedExit(exitIp))
-                {
-                    ok++;
-                    ip = exitIp;
-                }
-                else
-                {
-                    lastErr = err ?? (success ? $"Exit IP mismatch: {exitIp}" : "probe failed");
-                }
+                ClassifyFailure(m, pre.detail);
+                return (false, m.LastError ?? pre.detail);
             }
 
-            if (ok >= 1 && IsExactExpectedExit(ip))
+            await sb.StartAsync(cfg, ct, readyDelayMs: 220).ConfigureAwait(false);
+            var timeout = AdaptiveProbeTimeout(m, quick: true);
+            var (success, latency, exitIp, err) = await ProbeViaProxyAsync(port, timeout, ct).ConfigureAwait(false);
+            m.ProbeAttempts = 1;
+            m.ProbeSuccesses = success && IsExactExpectedExit(exitIp) ? 1 : 0;
+
+            if (success && IsExactExpectedExit(exitIp))
             {
-                m.ExitIp = ip;
-                return (true, $"recheck OK exit={ip}");
+                m.ExitIp = exitIp;
+                m.LatencyMs = latency;
+                _recentLatencyMs[m.Id] = latency;
+                return (true, $"recheck OK {latency:F0}ms exit={exitIp}");
             }
 
-            return (false, lastErr ?? "quick recheck failed");
+            return (false, err ?? (success ? $"Exit IP mismatch: {exitIp}" : "quick recheck failed"));
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
-            return (false, ex.Message);
+            ClassifyFailure(m, ex.Message + "\n" + sb.StderrSnapshot);
+            return (false, m.LastError ?? ex.Message);
         }
         finally
         {
-            await sb.StopAsync();
+            await sb.StopAsync().ConfigureAwait(false);
             if (cfg != null)
             {
                 try { File.Delete(cfg); } catch { /* ignore */ }
@@ -141,18 +151,51 @@ public sealed class DiscoveryService
         }
     }
 
+    private bool TryMarkNonRunnable(ProtocolMethod m, bool reportLog = true)
+    {
+        if (m.Id is "F01" or "F02")
+        {
+            m.Status = TestStatus.Skipped;
+            m.FailureKind = FailureKind.Unsupported;
+            m.SkipReason ??= "Unsupported: MASQUE requires sing-box >= 1.15.0 (engine is 1.14.4)";
+            m.LastError = m.SkipReason;
+            m.LastTestedAtUtc = DateTime.UtcNow;
+            if (reportLog) _log.Warn($"SKIPPED - {m.Id}: {m.SkipReason}");
+            return true;
+        }
+
+        if (m.IsSkipped)
+        {
+            m.Status = TestStatus.Skipped;
+            m.FailureKind = FailureKind.Unsupported;
+            m.LastError ??= m.SkipReason;
+            m.LastTestedAtUtc = DateTime.UtcNow;
+            if (reportLog) _log.Warn($"SKIPPED - {m.Id}: {m.SkipReason}");
+            return true;
+        }
+
+        if ((m.Id is "D01" or "D02") && !File.Exists(AppPaths.LibCronetDll))
+        {
+            m.Status = TestStatus.Skipped;
+            m.FailureKind = FailureKind.DependencyMissing;
+            m.SkipReason = "Dependency missing: libcronet.dll (NaiveProxy)";
+            m.LastError = m.SkipReason;
+            m.LastTestedAtUtc = DateTime.UtcNow;
+            if (reportLog) _log.Warn($"SKIPPED - {m.Id}: {m.SkipReason}");
+            return true;
+        }
+
+        return false;
+    }
+
     private void EnsureNaiveDependency(IReadOnlyList<ProtocolMethod> methods)
     {
-        var need = methods.Any(m => m.Id is "D01" or "D02" && !m.IsSkipped);
+        var need = methods.Any(m => (m.Id is "D01" or "D02") && !m.IsSkipped);
         if (!need) return;
         if (File.Exists(AppPaths.LibCronetDll))
-        {
             _log.Info("NaiveProxy dependency libcronet.dll present");
-        }
         else
-        {
             _log.Warn("NaiveProxy dependency libcronet.dll missing — D01/D02 will be skipped");
-        }
     }
 
     private async Task TestProxyMethodAsync(ProtocolMethod m, CancellationToken ct)
@@ -165,37 +208,75 @@ public sealed class DiscoveryService
         try
         {
             cfg = ConfigFactory.BuildDiscoveryConfig(_cred, m, port, AppPaths.WorkDir);
-            await sb.StartAsync(cfg, ct);
+
+            var pre = await PreflightConfigAsync(cfg, ct).ConfigureAwait(false);
+            if (!pre.ok)
+            {
+                m.Status = TestStatus.Fail;
+                m.LastTestedAtUtc = DateTime.UtcNow;
+                ClassifyFailure(m, pre.detail);
+                // Hard config/dependency errors stay Fail; no network wait
+                if (m.FailureKind is FailureKind.ConfigError or FailureKind.DependencyMissing or FailureKind.Unsupported)
+                {
+                    _log.Fail($"FAIL - {m.Id} (fail-fast): {m.LastError}");
+                }
+                else
+                {
+                    m.Status = TestStatus.Unverified;
+                    _log.Fail($"UNVERIFIED - {m.Id}: {m.LastError}");
+                }
+                return;
+            }
+
+            await sb.StartAsync(cfg, ct, readyDelayMs: 250).ConfigureAwait(false);
             swConnect.Stop();
             m.ConnectTimeMs = swConnect.Elapsed.TotalMilliseconds;
 
             var latencies = new List<double>();
             var verifiedIps = new List<string>();
             var ok = 0;
+            var attempts = 0;
+            string? lastErr = null;
+
             for (var i = 0; i < 3; i++)
             {
                 ct.ThrowIfCancellationRequested();
-                var (success, latency, ip, err) = await ProbeViaProxyAsync(port, ct);
+
+                // Early PASS: already 2 successes
+                if (ok >= 2) break;
+                // Remaining probes cannot reach 2 successes → stop (will be Unverified or Fail)
+                var remaining = 3 - i;
+                if (ok + remaining < 2) break;
+
+                attempts++;
+                var timeout = AdaptiveProbeTimeout(m, quick: false, sampleIndex: i, priorLatencies: latencies);
+                var (success, latency, ip, err) = await ProbeViaProxyAsync(port, timeout, ct).ConfigureAwait(false);
+
                 if (success && IsExactExpectedExit(ip))
                 {
                     ok++;
                     latencies.Add(latency);
                     verifiedIps.Add(ip!);
-                    _log.Info($"Probe {i + 1}/3 OK latency={latency:F0}ms exit={ip}");
+                    _recentLatencyMs[m.Id] = latency;
+                    _log.Info($"Probe {attempts}/3 OK latency={latency:F0}ms exit={ip}");
                 }
                 else if (success)
                 {
-                    _log.Warn($"Probe {i + 1}/3 Exit IP Mismatch: got={ip} expected={_cred.server_ip}");
-                    m.LastError = $"Exit IP Mismatch: {ip}";
+                    lastErr = $"Exit IP Mismatch: {ip}";
+                    m.LastError = lastErr;
+                    _log.Warn($"Probe {attempts}/3 Exit IP Mismatch: got={ip} expected={_cred.server_ip}");
                 }
                 else
                 {
-                    _log.Warn($"Probe {i + 1}/3 failed: {err}");
+                    lastErr = err;
                     m.LastError = err;
+                    _log.Warn($"Probe {attempts}/3 failed: {err}");
                 }
             }
 
-            m.SuccessRate = ok / 3.0;
+            m.ProbeAttempts = attempts;
+            m.ProbeSuccesses = ok;
+            m.SuccessRate = attempts > 0 ? ok / (double)attempts : 0;
             if (latencies.Count > 0)
             {
                 m.LatencyMs = latencies.Average();
@@ -208,32 +289,54 @@ public sealed class DiscoveryService
             {
                 m.Status = TestStatus.Pass;
                 m.FailureKind = FailureKind.None;
-                _log.Pass($"PASS - {m.Id} {m.DisplayName}");
+                _log.Pass($"PASS - {m.Id} {m.DisplayName} ({ok}/{attempts})");
             }
             else if (ok > 0)
             {
                 m.Status = TestStatus.Unverified;
-                m.LastError ??= "Incomplete verification (<2/3 probes or exit IP incomplete)";
+                m.LastError ??= $"Incomplete verification ({ok}/{attempts})";
                 _log.Fail($"UNVERIFIED - {m.Id}: {m.LastError}");
             }
             else
             {
-                m.Status = TestStatus.Fail;
-                ClassifyFailure(m, sb.StderrSnapshot);
-                _log.Fail($"FAIL - {m.Id} {m.DisplayName}: {m.LastError}");
+                ClassifyFailure(m, (lastErr ?? "") + "\n" + sb.StderrSnapshot);
+                // Transient network/timeout → Unverified; hard errors → Fail
+                if (m.FailureKind is FailureKind.Timeout or FailureKind.NetworkBlocked or FailureKind.Other)
+                {
+                    m.Status = TestStatus.Unverified;
+                    m.LastError ??= lastErr ?? "No successful probes (temporary/network)";
+                    _log.Fail($"UNVERIFIED - {m.Id}: {m.LastError}");
+                }
+                else
+                {
+                    m.Status = TestStatus.Fail;
+                    _log.Fail($"FAIL - {m.Id} {m.DisplayName}: {m.LastError}");
+                }
             }
+        }
+        catch (OperationCanceledException)
+        {
+            m.LastError = "Cancelled";
+            throw;
         }
         catch (Exception ex)
         {
-            m.Status = TestStatus.Fail;
-            m.LastError = ex.Message;
             m.LastTestedAtUtc = DateTime.UtcNow;
             ClassifyFailure(m, ex.Message + "\n" + sb.StderrSnapshot);
-            _log.Fail($"FAIL - {m.Id} {m.DisplayName}: {ex.Message}");
+            if (m.FailureKind is FailureKind.ConfigError or FailureKind.DependencyMissing or FailureKind.AuthenticationError)
+            {
+                m.Status = TestStatus.Fail;
+            }
+            else
+            {
+                m.Status = TestStatus.Unverified;
+            }
+            m.LastError ??= ex.Message;
+            _log.Fail($"{m.Status.ToString().ToUpperInvariant()} - {m.Id}: {m.LastError}");
         }
         finally
         {
-            await sb.StopAsync();
+            await sb.StopAsync().ConfigureAwait(false);
             if (cfg != null)
             {
                 try { File.Delete(cfg); } catch { /* ignore */ }
@@ -241,42 +344,119 @@ public sealed class DiscoveryService
         }
     }
 
-    private async Task<(bool ok, double latencyMs, string? ip, string? err)> ProbeViaProxyAsync(int mixedPort, CancellationToken ct)
+    private TimeSpan AdaptiveProbeTimeout(
+        ProtocolMethod m,
+        bool quick,
+        int sampleIndex = 0,
+        List<double>? priorLatencies = null)
+    {
+        var udp = m.Network.Equals("udp", StringComparison.OrdinalIgnoreCase);
+        double baseSec = quick
+            ? (udp ? 7.0 : 5.0)
+            : (udp ? 10.0 : 7.0);
+
+        if (_recentLatencyMs.TryGetValue(m.Id, out var known) && known > 0)
+        {
+            // 3× observed latency + margin, clamped
+            baseSec = Math.Clamp(known / 1000.0 * 3.5 + 1.5, quick ? 3.0 : 4.0, udp ? 14.0 : 11.0);
+        }
+        else if (priorLatencies is { Count: > 0 })
+        {
+            var avg = priorLatencies.Average();
+            baseSec = Math.Clamp(avg / 1000.0 * 3.0 + 1.2, 3.5, udp ? 12.0 : 10.0);
+        }
+
+        // First probe slightly more patient; later probes can be tighter if path looked fast
+        if (!quick && sampleIndex == 0)
+        {
+            baseSec = Math.Min(baseSec + 1.5, udp ? 14.0 : 11.0);
+        }
+        else if (!quick && sampleIndex > 0 && priorLatencies is { Count: > 0 } && priorLatencies.Average() < 400)
+        {
+            baseSec = Math.Max(3.5, baseSec * 0.75);
+        }
+
+        return TimeSpan.FromSeconds(baseSec);
+    }
+
+    private async Task<(bool ok, string detail)> PreflightConfigAsync(string cfgPath, CancellationToken ct)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = AppPaths.SingBoxExe,
+                Arguments = $"check -c \"{cfgPath}\"",
+                UseShellExecute = false,
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true,
+                WorkingDirectory = Path.GetDirectoryName(AppPaths.SingBoxExe) ?? AppPaths.BaseDir
+            };
+            using var p = Process.Start(psi) ?? throw new InvalidOperationException("sing-box check failed to start");
+            var errTask = p.StandardError.ReadToEndAsync(ct);
+            var outTask = p.StandardOutput.ReadToEndAsync(ct);
+            await p.WaitForExitAsync(ct).ConfigureAwait(false);
+            var err = await errTask.ConfigureAwait(false);
+            _ = await outTask.ConfigureAwait(false);
+            if (p.ExitCode != 0)
+            {
+                return (false, string.IsNullOrWhiteSpace(err) ? $"sing-box check exit={p.ExitCode}" : err.Trim());
+            }
+            return (true, "ok");
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
+    private async Task<(bool ok, double latencyMs, string? ip, string? err)> ProbeViaProxyAsync(
+        int mixedPort,
+        TimeSpan timeout,
+        CancellationToken ct)
     {
         var handler = new HttpClientHandler
         {
             Proxy = new WebProxy($"http://127.0.0.1:{mixedPort}"),
             UseProxy = true
         };
-        using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(14) };
+        using var client = new HttpClient(handler) { Timeout = timeout };
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        linked.CancelAfter(timeout);
         var sw = Stopwatch.StartNew();
         try
         {
-            using var r1 = await client.GetAsync("https://1.1.1.1/cdn-cgi/trace", ct);
+            using var r1 = await client.GetAsync("https://1.1.1.1/cdn-cgi/trace", linked.Token).ConfigureAwait(false);
             if (!r1.IsSuccessStatusCode)
             {
                 return (false, sw.Elapsed.TotalMilliseconds, null, $"HTTPS verification failed status={(int)r1.StatusCode}");
             }
-            var body = await r1.Content.ReadAsStringAsync(ct);
+            var body = await r1.Content.ReadAsStringAsync(linked.Token).ConfigureAwait(false);
             sw.Stop();
 
-            string? ip;
-            try
+            string? ip = null;
+            foreach (var line in body.Split('\n'))
             {
-                ip = (await client.GetStringAsync("https://api.ipify.org", ct)).Trim();
-            }
-            catch (Exception ex)
-            {
-                ip = null;
-                foreach (var line in body.Split('\n'))
+                if (line.StartsWith("ip=", StringComparison.OrdinalIgnoreCase))
                 {
-                    if (line.StartsWith("ip=", StringComparison.OrdinalIgnoreCase))
-                    {
-                        ip = line[3..].Trim();
-                        break;
-                    }
+                    ip = line[3..].Trim();
+                    break;
                 }
-                if (ip == null)
+            }
+
+            // Prefer ipify only if trace lacked ip (saves a round-trip when present)
+            if (string.IsNullOrWhiteSpace(ip))
+            {
+                try
+                {
+                    ip = (await client.GetStringAsync("https://api.ipify.org", linked.Token).ConfigureAwait(false)).Trim();
+                }
+                catch (Exception ex)
                 {
                     return (false, sw.Elapsed.TotalMilliseconds, null, $"Exit IP fetch failed: {ex.Message}");
                 }
@@ -287,6 +467,10 @@ public sealed class DiscoveryService
                 return (false, sw.Elapsed.TotalMilliseconds, null, "Exit IP missing");
             }
             return (true, sw.Elapsed.TotalMilliseconds, ip, null);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return (false, sw.Elapsed.TotalMilliseconds, null, "Connection Timeout");
         }
         catch (TaskCanceledException)
         {
@@ -315,7 +499,7 @@ public sealed class DiscoveryService
             m.LastError = "Dependency Missing";
         }
         else if (d.Contains("unknown outbound") || d.Contains("unknown endpoint") || d.Contains("decode config") ||
-                 d.Contains("missing `") || d.Contains("no outbound builder"))
+                 d.Contains("missing `") || d.Contains("no outbound builder") || d.Contains("sing-box check"))
         {
             m.FailureKind = FailureKind.ConfigError;
             m.LastError = "Config Error: " + Trim(detail ?? "");
@@ -364,7 +548,6 @@ public sealed class DiscoveryService
             var jitterScore = Math.Max(0, 100 - m.JitterMs / 5.0);
             var connectScore = Math.Max(0, 100 - m.ConnectTimeMs / 20.0);
             var successScore = m.SuccessRate * 100;
-            // Freshness bonus for recently tested methods
             var freshness = 10.0;
             if (m.LastTestedAtUtc is { } t)
             {
