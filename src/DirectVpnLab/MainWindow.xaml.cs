@@ -251,35 +251,6 @@ public partial class MainWindow : Window
             var discovery = new DiscoveryService(_log, _cred);
             var sw = System.Diagnostics.Stopwatch.StartNew();
             string? lastFail = null;
-            var eligible = new List<ProtocolMethod>();
-
-            foreach (var m in candidates)
-            {
-                ct.ThrowIfCancellationRequested();
-                _log.Info($"Quick Connect candidate {m.Id} {m.DisplayName}");
-                var (ok, detail) = await discovery.QuickRecheckAsync(m, ct);
-                if (!ok)
-                {
-                    m.IsHistorical = true;
-                    m.LastError = detail;
-                    lastFail = $"{m.Id}: {detail}";
-                    _log.Warn($"Quick recheck failed (cached Pass retained) — trying next: {lastFail}");
-                    continue;
-                }
-
-                m.IsHistorical = false;
-                m.LastTestedAtUtc = DateTime.UtcNow;
-                eligible.Add(m);
-                _log.Info($"Recheck OK — queued for TUN: {m.Id} ({detail})");
-            }
-
-            if (eligible.Count == 0)
-            {
-                SetUiState(ConnectionUiState.Failed, lastFail ?? "No method passed quick recheck");
-                _log.Fail("CONNECTION FAILED — no method passed quick recheck");
-                ClearConnInfo();
-                return;
-            }
 
             void OnPhase(string phase, string detail)
             {
@@ -304,39 +275,91 @@ public partial class MainWindow : Window
                 _log.Warn($"Recorded TUN health failure for {failedMethod.Id} [{cat}] on network {netFp}");
             }
 
-            // ConnectBestAsync runs TUN + real usable-internet check; fails over to next eligible
-            var (connOk, msg) = await _connection.ConnectBestAsync(eligible, ct, OnPhase, OnCandidateFailed);
-            if (connOk && _connection.IsConnected && _connection.UsableInternetVerified)
+            // Sequential Quick Connect: recheck ONE → TUN+health → next only on failure
+            for (var i = 0; i < candidates.Count; i++)
             {
-                sw.Stop();
-                var active = _connection.ActiveMethod!;
-                _persist.ClearTunFailure(_state, active.Id, netFp);
+                ct.ThrowIfCancellationRequested();
+                if (_userRequestedDisconnect) break;
 
-                ApplyConnectedUi(active, sw.Elapsed);
-                _state.BestMethodId = active.Id;
-                _state.LastExitIp = active.ExitIp;
-                if (!_state.ResultsStale) _state.StaleReason = null;
-                _state.LastTestIncomplete = false;
-                _persist.UpsertMethod(_state, active);
-                foreach (var other in _methods.Where(x => x.Id != active.Id))
+                var m = candidates[i];
+                if (i > 0)
                 {
-                    other.IsHistorical = true;
-                    _persist.UpsertMethod(_state, other);
+                    SetUiState(ConnectionUiState.Switching, $"Next: {m.Id} {m.DisplayName}");
+                    _log.Info($"SWITCHING → Quick Connect next candidate {m.Id} {m.DisplayName}");
                 }
-                _persist.Save(_state, _cred);
-                _lastCompleteState = CloneState(_state);
-                UpdatePersistMeta();
-                _healthTimer.Start();
-                _log.Info($"Quick Connect finished in {sw.Elapsed.TotalSeconds:F1}s via {active.Id} (usable internet OK)");
-                return;
+                else
+                {
+                    SetUiState(ConnectionUiState.Connecting, $"Recheck {m.Id}");
+                }
+
+                _log.Info($"Quick Connect candidate {m.Id} {m.DisplayName} — recheck then TUN (not waiting for others)");
+                var (reOk, reDetail) = await discovery.QuickRecheckAsync(m, ct);
+                if (!reOk)
+                {
+                    m.IsHistorical = true;
+                    m.LastError = reDetail;
+                    lastFail = $"{m.Id}: {reDetail}";
+                    _log.Warn($"Quick recheck failed (cached Pass retained) — trying next: {lastFail}");
+                    continue;
+                }
+
+                m.IsHistorical = false;
+                m.LastTestedAtUtc = DateTime.UtcNow;
+                _log.Info($"Recheck OK — starting TUN immediately for {m.Id} ({reDetail})");
+                SetUiState(ConnectionUiState.Connecting, $"TUN {m.Id}");
+
+                var (connOk, msg) = await _connection.ConnectBestAsync(
+                    new[] { m }, ct, OnPhase, OnCandidateFailed);
+
+                if (connOk && _connection.IsConnected && _connection.UsableInternetVerified)
+                {
+                    sw.Stop();
+                    var active = _connection.ActiveMethod!;
+                    _persist.ClearTunFailure(_state, active.Id, netFp);
+
+                    ApplyConnectedUi(active, sw.Elapsed);
+                    _state.BestMethodId = active.Id;
+                    _state.LastExitIp = active.ExitIp;
+                    if (!_state.ResultsStale) _state.StaleReason = null;
+                    _state.LastTestIncomplete = false;
+                    _persist.UpsertMethod(_state, active);
+                    foreach (var other in _methods.Where(x => x.Id != active.Id))
+                    {
+                        other.IsHistorical = true;
+                        _persist.UpsertMethod(_state, other);
+                    }
+                    _persist.Save(_state, _cred);
+                    _lastCompleteState = CloneState(_state);
+                    UpdatePersistMeta();
+                    _healthTimer.Start();
+                    _log.Info($"Quick Connect finished in {sw.Elapsed.TotalSeconds:F1}s via {active.Id} (usable internet OK)");
+                    return;
+                }
+
+                lastFail = msg;
+                _log.Warn($"Connect candidate {m.Id} failed: {msg}");
+
+                if (ConnectionService.IsFatalMessage(msg) ||
+                    ConnectionService.IsSharedTunConfigFailure(msg) ||
+                    msg.Contains("Cleanup Error", StringComparison.OrdinalIgnoreCase) ||
+                    ConnectionService.ShouldStopCascadeForSharedEvidence(
+                        _connection.LastHealthFailureCategory ?? ConnectionService.ClassifyHealthCategory(msg),
+                        2, msg))
+                {
+                    _persist.Save(_state, _cred);
+                    _lastCompleteState = CloneState(_state);
+                    sw.Stop();
+                    SetUiState(ConnectionUiState.Failed, msg);
+                    _log.Fail(msg);
+                    ClearConnInfo();
+                    return;
+                }
             }
 
             _persist.Save(_state, _cred);
             _lastCompleteState = CloneState(_state);
 
             sw.Stop();
-            lastFail = msg;
-            _log.Warn($"Connect failed: {msg}");
             SetUiState(ConnectionUiState.Failed, lastFail ?? "CONNECTION FAILED — no usable VPN path");
             _log.Fail(lastFail ?? "CONNECTION FAILED — no usable VPN path");
             ClearConnInfo();
@@ -542,12 +565,25 @@ public partial class MainWindow : Window
 
     private async Task DoDisconnectAsync()
     {
-        if (!TryBeginOp()) return;
+        // Manual disconnect wins: stop monitor/auto-failover first, then wait for other ops
         _userRequestedDisconnect = true;
         _healthFailStreak = 0;
         _healthTimer.Stop();
         _durationTimer.Stop();
         _cts?.Cancel();
+
+        var deadline = DateTime.UtcNow.AddSeconds(20);
+        var acquiredOp = false;
+        while (!(acquiredOp = TryBeginOp()))
+        {
+            if (DateTime.UtcNow >= deadline)
+            {
+                _log.Warn("Disconnect: timed out waiting for connect/failover lock — forcing cleanup");
+                break;
+            }
+            await Task.Delay(100);
+        }
+
         SetBusy(true);
         try
         {
@@ -564,42 +600,76 @@ public partial class MainWindow : Window
         finally
         {
             SetBusy(false);
-            EndOp();
+            if (acquiredOp) EndOp();
         }
     }
 
     private async Task HealthTickAsync()
     {
         if (_userRequestedDisconnect) return;
+        if (_uiState is not (ConnectionUiState.Connected or ConnectionUiState.Degraded)) return;
         if (Interlocked.CompareExchange(ref _healthGate, 1, 0) != 0) return;
 
         try
         {
-            if (!_connection.IsConnected)
+            // TUN dead → do not wait for a second soft failure
+            if (!_connection.IsTunnelRunning)
             {
-                if (_uiState == ConnectionUiState.Connected)
-                {
-                    SetUiState(ConnectionUiState.Failed, "Connection no longer verified");
-                    _log.Fail("Connection no longer verified");
-                }
+                _log.Warn("Health monitor: TUN no longer running — immediate failover path");
+                _healthFailStreak = 2;
+                SetUiState(ConnectionUiState.Degraded, "TUN stopped");
+                await FailoverAfterHealthAsync(null, "TUN stopped");
                 return;
             }
 
             var (ok, exitIp, detail) = await _connection.VerifyHealthAsync(CancellationToken.None);
+            if (_userRequestedDisconnect) return;
+
             if (ok)
             {
+                var recovered = _healthFailStreak > 0 || _uiState == ConnectionUiState.Degraded;
                 _healthFailStreak = 0;
+                if (recovered || _uiState != ConnectionUiState.Connected)
+                {
+                    _log.Info("Health recovered — returning to CONNECTED");
+                    SetUiState(ConnectionUiState.Connected);
+                    if (_connection.ActiveMethod != null)
+                    {
+                        TxtExitIp.Text = $"Exit IP: {_connection.ActiveMethod.ExitIp ?? exitIp ?? "—"}";
+                        TxtConnStatus.Text = "Status: CONNECTED";
+                    }
+                }
                 return;
             }
 
+            // First failure: DEGRADED; keep TUN up so the next tick can confirm
             _healthFailStreak++;
             _log.Warn($"Health check failed ({_healthFailStreak}): {detail}");
             SetUiState(ConnectionUiState.Degraded, detail);
 
-            // Require two consecutive failures — ignore a single transient timeout
             if (_healthFailStreak < 2) return;
             if (_userRequestedDisconnect) return;
 
+            await FailoverAfterHealthAsync(exitIp, detail);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _healthGate, 0);
+        }
+    }
+
+    private async Task FailoverAfterHealthAsync(string? previousExitIp, string detail)
+    {
+        if (_userRequestedDisconnect) return;
+        if (!TryBeginOp())
+        {
+            _log.Warn("Failover skipped — another operation in progress");
+            return;
+        }
+
+        _healthTimer.Stop();
+        try
+        {
             var failedId = _connection.ActiveMethod?.Id;
             var netFp = PersistenceService.CaptureNetworkFingerprint();
             if (!string.IsNullOrEmpty(failedId))
@@ -607,15 +677,23 @@ public partial class MainWindow : Window
                 _persist.RecordTunFailure(_state, failedId, netFp,
                     _connection.LastHealthFailureCategory ?? ConnectionService.ClassifyHealthCategory(detail),
                     detail);
+                _log.Warn($"Recorded post-connect TUN failure for {failedId} on network {netFp}");
             }
 
-            SetUiState(ConnectionUiState.Switching, "Switching after sustained health failure");
-            var ranked = _methods
+            var nextPreview = _methods
                 .Where(m => m.Status == TestStatus.Pass)
                 .Where(m => failedId == null || !string.Equals(m.Id, failedId, StringComparison.OrdinalIgnoreCase))
                 .Where(m => !_persist.GetTunFailureIdsForNetwork(_state, netFp).Contains(m.Id, StringComparer.OrdinalIgnoreCase))
-                .OrderBy(m => m.Rank)
-                .ToList();
+                .OrderBy(m => m.Rank == 0 ? int.MaxValue : m.Rank)
+                .ThenByDescending(m => m.QualityScore)
+                .FirstOrDefault();
+
+            SetUiState(ConnectionUiState.Switching,
+                nextPreview == null
+                    ? "No alternate protocol"
+                    : $"From {failedId ?? "?"} → {nextPreview.Id}");
+            _log.Info(
+                $"SWITCHING after sustained health failure — next candidate: {(nextPreview == null ? "(none)" : nextPreview.Id)}");
 
             var (discOk, discMsg) = await _connection.DisconnectAsync();
             if (!discOk)
@@ -626,15 +704,23 @@ public partial class MainWindow : Window
                 return;
             }
 
-            if (_userRequestedDisconnect) return;
+            if (_userRequestedDisconnect)
+            {
+                ClearConnInfo();
+                SetUiState(ConnectionUiState.Disconnected);
+                return;
+            }
+
+            var ranked = _methods
+                .Where(m => m.Status == TestStatus.Pass)
+                .Where(m => failedId == null || !string.Equals(m.Id, failedId, StringComparison.OrdinalIgnoreCase))
+                .Where(m => !_persist.GetTunFailureIdsForNetwork(_state, netFp).Contains(m.Id, StringComparer.OrdinalIgnoreCase))
+                .OrderBy(m => m.Rank == 0 ? int.MaxValue : m.Rank)
+                .ThenByDescending(m => m.QualityScore)
+                .ToList();
 
             var discovery = new DiscoveryService(_log, _cred);
-            var eligible = new List<ProtocolMethod>();
-            foreach (var m in ranked)
-            {
-                var (rOk, _) = await discovery.QuickRecheckAsync(m, CancellationToken.None);
-                if (rOk) eligible.Add(m);
-            }
+            string? lastFail = null;
 
             void OnPhase(string phase, string d)
             {
@@ -642,29 +728,66 @@ public partial class MainWindow : Window
                 {
                     if (phase == "VERIFYING") SetUiState(ConnectionUiState.Verifying, d);
                     else if (phase == "SWITCHING") SetUiState(ConnectionUiState.Switching, d);
+                    else if (phase == "CONNECTING") SetUiState(ConnectionUiState.Connecting, d);
                 });
             }
 
-            var (reOk, msg) = await _connection.ConnectBestAsync(eligible, CancellationToken.None, OnPhase);
-            if (reOk && _connection.IsConnected && _connection.UsableInternetVerified)
+            void OnFailed(ProtocolMethod failedMethod, string failMsg)
             {
-                _healthFailStreak = 0;
-                var a = _connection.ActiveMethod!;
-                _persist.ClearTunFailure(_state, a.Id, netFp);
-                ApplyConnectedUi(a, TimeSpan.Zero);
-                TxtExitIp.Text = $"Exit IP: {a.ExitIp ?? exitIp ?? "—"}";
-                _persist.Save(_state, _cred);
+                var cat = _connection.LastHealthFailureCategory
+                          ?? ConnectionService.ClassifyHealthCategory(failMsg);
+                _persist.RecordTunFailure(_state, failedMethod.Id, netFp, cat, failMsg);
             }
-            else
+
+            foreach (var m in ranked)
             {
-                ClearConnInfo();
-                SetUiState(ConnectionUiState.Failed, msg);
-                _log.Fail(msg);
+                if (_userRequestedDisconnect) break;
+
+                SetUiState(ConnectionUiState.Switching, $"Trying {m.Id} {m.DisplayName}");
+                _log.Info($"Failover recheck+TUN for {m.Id} (sequential, not bulk recheck)");
+                var (rOk, rDetail) = await discovery.QuickRecheckAsync(m, CancellationToken.None);
+                if (!rOk)
+                {
+                    lastFail = $"{m.Id}: {rDetail}";
+                    _log.Warn($"Failover recheck failed: {lastFail}");
+                    continue;
+                }
+
+                var (reOk, msg) = await _connection.ConnectBestAsync(
+                    new[] { m }, CancellationToken.None, OnPhase, OnFailed);
+                if (reOk && _connection.IsConnected && _connection.UsableInternetVerified)
+                {
+                    _healthFailStreak = 0;
+                    var a = _connection.ActiveMethod!;
+                    _persist.ClearTunFailure(_state, a.Id, netFp);
+                    ApplyConnectedUi(a, TimeSpan.Zero);
+                    TxtExitIp.Text = $"Exit IP: {a.ExitIp ?? previousExitIp ?? "—"}";
+                    _persist.Save(_state, _cred);
+                    _healthTimer.Start();
+                    _log.Info($"Failover CONNECTED via {a.Id}");
+                    return;
+                }
+
+                lastFail = msg;
+                if (ConnectionService.IsFatalMessage(msg) ||
+                    msg.Contains("Cleanup Error", StringComparison.OrdinalIgnoreCase) ||
+                    ConnectionService.ShouldStopCascadeForSharedEvidence(
+                        _connection.LastHealthFailureCategory ?? ConnectionService.ClassifyHealthCategory(msg),
+                        2, msg))
+                {
+                    break;
+                }
             }
+
+            ClearConnInfo();
+            var failMsg = lastFail ?? "No usable alternate protocol after health failure";
+            SetUiState(ConnectionUiState.Failed, failMsg);
+            _log.Fail(failMsg);
+            _persist.Save(_state, _cred);
         }
         finally
         {
-            Interlocked.Exchange(ref _healthGate, 0);
+            EndOp();
         }
     }
 

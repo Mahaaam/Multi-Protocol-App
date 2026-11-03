@@ -15,6 +15,7 @@ public sealed class ConnectionService
 
     private readonly LiveLogService _log;
     private readonly LabCredentials _cred;
+    private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private SingBoxProcess? _tunProcess;
     private ProtocolMethod? _active;
     private bool _verifiedConnected;
@@ -31,13 +32,18 @@ public sealed class ConnectionService
     public bool UsableInternetVerified => _usableInternetVerified;
     public string? LastHealthFailureCategory => _lastHealthCategory;
 
+    /// <summary>TUN process + interface up — independent of usable-internet verification.</summary>
+    public bool IsTunnelRunning =>
+        _tunProcess?.IsRunning == true &&
+        _active != null &&
+        TunInterfaceUp();
+
+    /// <summary>Fully verified usable Full-Tunnel (TUN + path + usable internet).</summary>
     public bool IsConnected =>
         _verifiedConnected &&
         _pathVerified &&
         _usableInternetVerified &&
-        _tunProcess?.IsRunning == true &&
-        _active != null &&
-        TunInterfaceUp();
+        IsTunnelRunning;
 
     public ConnectionService(LiveLogService log, LabCredentials cred)
     {
@@ -78,6 +84,27 @@ public sealed class ConnectionService
         CancellationToken ct,
         Action<string, string>? onPhase = null,
         Action<ProtocolMethod, string>? onCandidateFailed = null)
+    {
+        if (!await _lifecycle.WaitAsync(0, ct))
+        {
+            return (false, "Another connect/disconnect operation is in progress");
+        }
+
+        try
+        {
+            return await ConnectBestCoreAsync(rankedPass, ct, onPhase, onCandidateFailed);
+        }
+        finally
+        {
+            _lifecycle.Release();
+        }
+    }
+
+    private async Task<(bool ok, string message)> ConnectBestCoreAsync(
+        IEnumerable<ProtocolMethod> rankedPass,
+        CancellationToken ct,
+        Action<string, string>? onPhase,
+        Action<ProtocolMethod, string>? onCandidateFailed)
     {
         var fatal = CheckFatalPrerequisites();
         if (fatal != null)
@@ -130,7 +157,14 @@ public sealed class ConnectionService
             }
 
             _log.Info($"Starting Windows tunnel with {m.Id} {m.DisplayName}");
-            await CleanupTunnelAsync(verifyInternetRestored: false);
+            var (preCleanOk, preCleanMsg) = await CleanupTunnelAsync(verifyInternetRestored: false);
+            if (!preCleanOk)
+            {
+                var stop = $"Cleanup Error — cannot start next protocol: {preCleanMsg}";
+                _log.Fail(stop);
+                return (false, stop);
+            }
+
             var (ok, msg) = await TryConnectMethodAsync(m, ct, onPhase);
             if (ok)
             {
@@ -147,14 +181,21 @@ public sealed class ConnectionService
             _pathVerified = false;
             _usableInternetVerified = false;
             try { onCandidateFailed?.Invoke(m, msg); } catch { /* UI callback must not break cascade */ }
-            await CleanupTunnelAsync(verifyInternetRestored: false);
+
+            var (postCleanOk, postCleanMsg) = await CleanupTunnelAsync(verifyInternetRestored: false);
+            if (!postCleanOk)
+            {
+                var stop = $"Cleanup Error — cannot try next protocol: {postCleanMsg}";
+                _log.Fail(stop);
+                return (false, stop);
+            }
 
             if (IsFatalConnectError(msg) || IsSharedTunConfigFailure(msg))
             {
                 return (false, msg);
             }
 
-            // Same health category on consecutive protocols → shared tunnel/DNS problem
+            // Track consecutive similar categories — stop only on definitive shared evidence
             var cat = _lastHealthCategory ?? ClassifyHealthCategory(msg);
             if (!string.IsNullOrEmpty(cat) &&
                 string.Equals(cat, _sharedHealthCategory, StringComparison.OrdinalIgnoreCase))
@@ -167,11 +208,18 @@ public sealed class ConnectionService
                 _sharedHealthFailStreak = 1;
             }
 
-            if (_sharedHealthFailStreak >= 2 && IsSharedHealthCategory(cat))
+            if (ShouldStopCascadeForSharedEvidence(cat, _sharedHealthFailStreak, msg))
             {
-                var shared = $"Shared TUN/DNS failure ({cat}) after {_sharedHealthFailStreak} protocols — stopping cascade";
+                var shared =
+                    $"Shared TUN/route failure ({cat}) after {_sharedHealthFailStreak} protocols — stopping cascade";
                 _log.Fail(shared);
                 return (false, shared);
+            }
+
+            if (!string.IsNullOrEmpty(cat) && IsProtocolOrTransientCategory(cat))
+            {
+                _log.Info(
+                    $"Health category {cat} treated as protocol/transient — will try next candidate if any");
             }
         }
 
@@ -224,20 +272,32 @@ public sealed class ConnectionService
 
     public async Task<(bool ok, string message)> DisconnectAsync()
     {
-        _log.Info("Disconnect requested");
-        _verifiedConnected = false;
-        _pathVerified = false;
-        _usableInternetVerified = false;
-        var (cleanOk, cleanMsg) = await CleanupTunnelAsync(verifyInternetRestored: true);
-        _active = null;
-        if (!cleanOk)
+        if (!await _lifecycle.WaitAsync(TimeSpan.FromSeconds(45)))
         {
-            _log.Fail($"Disconnect cleanup incomplete: {cleanMsg}");
-            return (false, cleanMsg);
+            return (false, "Disconnect blocked — connect/failover still holding lifecycle lock");
         }
 
-        _log.Info("Disconnected - application-owned resources cleaned; normal path check OK");
-        return (true, "Disconnected and network cleanup verified");
+        try
+        {
+            _log.Info("Disconnect requested");
+            _verifiedConnected = false;
+            _pathVerified = false;
+            _usableInternetVerified = false;
+            var (cleanOk, cleanMsg) = await CleanupTunnelAsync(verifyInternetRestored: true);
+            _active = null;
+            if (!cleanOk)
+            {
+                _log.Fail($"Disconnect cleanup incomplete: {cleanMsg}");
+                return (false, cleanMsg);
+            }
+
+            _log.Info("Disconnected - application-owned resources cleaned; normal path check OK");
+            return (true, "Disconnected and network cleanup verified");
+        }
+        finally
+        {
+            _lifecycle.Release();
+        }
     }
 
     private async Task<(bool ok, string message)> TryConnectMethodAsync(
@@ -585,7 +645,7 @@ public sealed class ConnectionService
             return FailHealth("DOWNLOAD", ex.Message, true, httpsOk, got, swAll.Elapsed.TotalMilliseconds, exitIp);
         }
 
-        // 4) IPv6 leak / unusable path note (non-fatal if IPv6 simply fails)
+        // 4) IPv6: absent/unreachable = OK; real non-VPN IPv6 exit = leak (not Full-Tunnel healthy)
         var ipv6Note = "no-ipv6-or-unreachable";
         try
         {
@@ -593,17 +653,31 @@ public sealed class ConnectionService
             {
                 Timeout = TimeSpan.FromSeconds(4)
             };
-            // If this succeeds with a non-NL address, flag possible leak; NL v6 unlikely on lab
             var body = await v6Client.GetStringAsync("https://api64.ipify.org", ct);
             var v6ip = body.Trim();
-            if (!string.IsNullOrWhiteSpace(v6ip) && !IsExactExpectedExit(v6ip) && v6ip.Contains(':'))
+            if (IPAddress.TryParse(v6ip, out var parsed) &&
+                parsed.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6)
             {
-                ipv6Note = $"possible_ipv6_leak:{v6ip}";
-                _log.Warn($"IPv6 path may bypass tunnel (exit {v6ip}) — IPv4 VPN still required");
+                if (IsExactExpectedExit(v6ip))
+                {
+                    ipv6Note = "ipv6_via_tunnel";
+                }
+                else
+                {
+                    // Usable IPv6 outside VPN path — do not declare Full-Tunnel healthy
+                    return FailHealth("IPV6_LEAK",
+                        $"IPv6 exits outside VPN ({v6ip})",
+                        true, httpsOk, got, swAll.Elapsed.TotalMilliseconds, exitIp);
+                }
             }
             else if (IsExactExpectedExit(v6ip))
             {
-                ipv6Note = "ipv6_via_tunnel_or_mapped";
+                ipv6Note = "ipv4_only_via_tunnel";
+            }
+            else
+            {
+                // api64 returned IPv4 → dual-stack not in use for this probe
+                ipv6Note = "ipv6_absent_ok";
             }
         }
         catch
@@ -643,24 +717,50 @@ public sealed class ConnectionService
     public static string ClassifyHealthCategory(string msg)
     {
         var d = (msg ?? "").ToLowerInvariant();
+        if (d.Contains("ipv6_leak") || d.Contains("ipv6 exits outside")) return "IPV6_LEAK";
         if (d.Contains("[dns]") || d.Contains("dns ")) return "DNS";
         if (d.Contains("download_stall") || d.Contains("throughput too low") || d.Contains("incomplete"))
             return "DOWNLOAD_STALL";
         if (d.Contains("download")) return "DOWNLOAD";
         if (d.Contains("exit ip")) return "EXIT_IP";
         if (d.Contains("https")) return "HTTPS";
-        if (d.Contains("route path")) return "ROUTE";
+        if (d.Contains("route path") || d.Contains("route path error")) return "ROUTE";
+        if (d.Contains("interface not active")) return "TUN_IFACE";
         return "OTHER";
     }
 
-    private static bool IsSharedHealthCategory(string? cat) =>
-        cat is "DNS" or "DOWNLOAD_STALL" or "ROUTE";
+    /// <summary>
+    /// Protocol-specific or mobile-transient categories — do NOT stop the whole cascade.
+    /// </summary>
+    public static bool IsProtocolOrTransientCategory(string? cat) =>
+        cat is "DNS" or "DOWNLOAD_STALL" or "DOWNLOAD" or "HTTPS" or "EXIT_IP" or "IPV6_LEAK" or "OTHER";
 
+    /// <summary>
+    /// Stop cascade only with reliable shared TUN/Windows-path evidence (not mere similar DNS/stall).
+    /// </summary>
+    public static bool ShouldStopCascadeForSharedEvidence(string? cat, int streak, string msg)
+    {
+        if (IsFatalMessage(msg) || IsSharedTunConfigFailure(msg))
+            return true;
+
+        // Windows effective path never via DirectVpnLab across 2 protocols → shared route problem
+        if (streak >= 2 && cat is "ROUTE" or "TUN_IFACE")
+            return true;
+
+        return false;
+    }
+
+    /// <summary>
+    /// Periodic health probe. Requires TUN still running — does NOT require prior usable flag,
+    /// so a first failure (DEGRADED) can still run the confirming second check.
+    /// </summary>
     public async Task<(bool ok, string? exitIp, string detail)> VerifyHealthAsync(CancellationToken ct)
     {
-        if (_tunProcess?.IsRunning != true || !TunInterfaceUp() || !_pathVerified || !_usableInternetVerified)
+        if (_tunProcess?.IsRunning != true || !TunInterfaceUp() || _active == null)
         {
-            return (false, null, "TUN/path/usable-internet not active");
+            _usableInternetVerified = false;
+            _lastHealthCategory = "TUN_IFACE";
+            return (false, null, "TUN not active");
         }
 
         var (pathOk, pathDetail) = VerifyTrafficUsesTun(new[] { "1.1.1.1" });
@@ -668,19 +768,24 @@ public sealed class ConnectionService
         {
             _pathVerified = false;
             _usableInternetVerified = false;
+            _lastHealthCategory = "ROUTE";
             return (false, null, pathDetail);
         }
+
+        _pathVerified = true;
 
         // Periodic monitor: lighter but still requires DNS + named HTTPS + smaller payload
         var health = await VerifyUsableInternetAsync(ct, fullCheck: false);
         if (!health.Ok)
         {
+            // Clear usable flag for UI (DEGRADED) but keep tunnel running for next tick
             _usableInternetVerified = false;
             _lastHealthCategory = health.Category;
             return (false, health.ExitIp, $"[{health.Category}] {health.Detail}");
         }
 
         _usableInternetVerified = true;
+        _verifiedConnected = true;
         return (true, health.ExitIp, "ok");
     }
 
