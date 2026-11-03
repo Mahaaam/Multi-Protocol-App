@@ -38,8 +38,33 @@ public sealed class ProtocolMethod
     public string? ExitIp { get; set; }
     public string? LastError { get; set; }
     public int Rank { get; set; }
+    public DateTime? LastTestedAtUtc { get; set; }
+    public bool IsHistorical { get; set; }
+    public FailureKind FailureKind { get; set; } = FailureKind.None;
 
     public string DisplayName => $"{Protocol} + {Transport}";
+    public string StatusLabel => Status switch
+    {
+        TestStatus.Pass when IsHistorical => "Pass (cached)",
+        TestStatus.Pass => "Pass",
+        TestStatus.Fail => "Fail",
+        TestStatus.Unverified => "Unverified",
+        TestStatus.Skipped => "Skipped",
+        TestStatus.Pending => "Pending",
+        _ => Status.ToString()
+    };
+}
+
+public enum FailureKind
+{
+    None,
+    Unsupported,
+    NetworkBlocked,
+    ConfigError,
+    DependencyMissing,
+    AuthenticationError,
+    Timeout,
+    Other
 }
 
 public sealed class SpeedTestResult

@@ -26,6 +26,10 @@ public static class AppPaths
         Path.Combine(BaseDir, "Assets", "sing-box", "wintun.dll"),
         Path.Combine(BaseDir, "wintun.dll"));
 
+    public static string LibCronetDll => FirstExisting(
+        Path.Combine(BaseDir, "Assets", "sing-box", "libcronet.dll"),
+        Path.Combine(BaseDir, "libcronet.dll"));
+
     public static string CredentialsPath => FirstExisting(
         Path.Combine(BaseDir, "Assets", "certs", "credentials.json"),
         Path.Combine(BaseDir, "credentials.json"));

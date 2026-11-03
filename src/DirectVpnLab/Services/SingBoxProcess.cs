@@ -1,9 +1,10 @@
 using System.Diagnostics;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace DirectVpnLab.Services;
 
-public sealed class SingBoxProcess : IAsyncDisposable
+public sealed partial class SingBoxProcess : IAsyncDisposable
 {
     private Process? _process;
     private readonly LiveLogService _log;
@@ -37,11 +38,8 @@ public sealed class SingBoxProcess : IAsyncDisposable
         }
 
         var exeDir = Path.GetDirectoryName(AppPaths.SingBoxExe)!;
-        var wintunTarget = Path.Combine(exeDir, "wintun.dll");
-        if (!File.Exists(wintunTarget) && File.Exists(AppPaths.WintunDll))
-        {
-            File.Copy(AppPaths.WintunDll, wintunTarget, true);
-        }
+        EnsureSidecar(AppPaths.WintunDll, Path.Combine(exeDir, "wintun.dll"));
+        EnsureSidecar(AppPaths.LibCronetDll, Path.Combine(exeDir, "libcronet.dll"));
 
         ConfigPath = Path.GetFullPath(configPath);
         var psi = new ProcessStartInfo
@@ -60,14 +58,15 @@ public sealed class SingBoxProcess : IAsyncDisposable
         {
             if (!string.IsNullOrWhiteSpace(e.Data))
             {
-                _log.Info($"sing-box: {e.Data}");
+                RouteSingBoxLine(e.Data);
             }
         };
         _process.ErrorDataReceived += (_, e) =>
         {
             if (string.IsNullOrWhiteSpace(e.Data)) return;
-            lock (_stderr) _stderr.AppendLine(e.Data);
-            _log.Warn($"sing-box: {e.Data}");
+            var clean = StripAnsi(e.Data);
+            lock (_stderr) _stderr.AppendLine(clean);
+            RouteSingBoxLine(clean);
         };
 
         if (!_process.Start())
@@ -92,6 +91,47 @@ public sealed class SingBoxProcess : IAsyncDisposable
         if (_process.HasExited)
         {
             throw new InvalidOperationException($"sing-box exited early code={_process.ExitCode}. {StderrSnapshot}");
+        }
+    }
+
+    private void RouteSingBoxLine(string raw)
+    {
+        var line = StripAnsi(raw).Trim();
+        if (string.IsNullOrWhiteSpace(line)) return;
+
+        // sing-box often writes all levels to stderr — classify by content
+        if (ContainsLevel(line, "FATAL") || ContainsLevel(line, "ERROR"))
+        {
+            _log.Error($"sing-box: {line}");
+        }
+        else if (ContainsLevel(line, "WARN") || ContainsLevel(line, "WARNING"))
+        {
+            _log.Warn($"sing-box: {line}");
+        }
+        else
+        {
+            _log.Info($"sing-box: {line}");
+        }
+    }
+
+    private static bool ContainsLevel(string line, string level) =>
+        line.Contains($"[{level}]", StringComparison.OrdinalIgnoreCase) ||
+        line.Contains($"{level}[", StringComparison.OrdinalIgnoreCase) ||
+        Regex.IsMatch(line, $@"\b{level}\b", RegexOptions.IgnoreCase);
+
+    private static void EnsureSidecar(string source, string target)
+    {
+        try
+        {
+            if (File.Exists(source) &&
+                (!File.Exists(target) || new FileInfo(source).Length != new FileInfo(target).Length))
+            {
+                File.Copy(source, target, true);
+            }
+        }
+        catch
+        {
+            // non-fatal; caller may still fail later with clearer message
         }
     }
 
@@ -122,4 +162,10 @@ public sealed class SingBoxProcess : IAsyncDisposable
     }
 
     public async ValueTask DisposeAsync() => await StopAsync();
+
+    [GeneratedRegex(@"\x1B\[[0-9;]*[mK]|\x1B\][^\x07]*\x07|\x1B[@-Z\\-_]", RegexOptions.Compiled)]
+    private static partial Regex AnsiRegex();
+
+    internal static string StripAnsi(string input) =>
+        string.IsNullOrEmpty(input) ? input : AnsiRegex().Replace(input, "");
 }

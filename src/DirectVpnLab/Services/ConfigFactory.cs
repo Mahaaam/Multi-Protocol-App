@@ -13,9 +13,6 @@ public static class ConfigFactory
 
     public static string BuildDiscoveryConfig(LabCredentials cred, ProtocolMethod method, int localMixedPort, string workDir)
     {
-        var outbound = BuildOutbound(cred, method)
-            ?? throw new InvalidOperationException($"No outbound builder for {method.Id}");
-
         var root = new JsonObject
         {
             ["log"] = new JsonObject { ["level"] = "info", ["timestamp"] = true },
@@ -31,13 +28,11 @@ public static class ConfigFactory
             },
             ["outbounds"] = new JsonArray
             {
-                outbound,
                 new JsonObject { ["type"] = "direct", ["tag"] = "direct" }
             },
             ["route"] = new JsonObject { ["final"] = "proxy" }
         };
 
-        // Client chain: Shadowsocks (payload) -> ShadowTLS (detour/transport)
         if (method.Id == "C02")
         {
             root["outbounds"] = new JsonArray
@@ -46,6 +41,27 @@ public static class ConfigFactory
                 BuildShadowTlsOutbound(cred),
                 new JsonObject { ["type"] = "direct", ["tag"] = "direct" }
             };
+            root["route"] = new JsonObject { ["final"] = "proxy" };
+        }
+        else if (method.Id is "E04" or "F03" or "F04")
+        {
+            root["endpoints"] = new JsonArray { BuildClientEndpoint(cred, method) };
+            root["outbounds"] = new JsonArray
+            {
+                new JsonObject { ["type"] = "direct", ["tag"] = "direct" }
+            };
+            root["route"] = new JsonObject { ["final"] = method.Id };
+        }
+        else
+        {
+            var outbound = BuildOutbound(cred, method)
+                ?? throw new InvalidOperationException($"No outbound builder for {method.Id}");
+            root["outbounds"] = new JsonArray
+            {
+                outbound,
+                new JsonObject { ["type"] = "direct", ["tag"] = "direct" }
+            };
+            root["route"] = new JsonObject { ["final"] = "proxy" };
         }
 
         var path = Path.Combine(workDir, $"discover-{method.Id}.json");
@@ -55,30 +71,39 @@ public static class ConfigFactory
 
     public static string BuildTunConfig(LabCredentials cred, ProtocolMethod method, string workDir)
     {
-        JsonNode proxyOutbound = method.Id == "C02"
-            ? BuildSsOverShadowTls(cred)
-            : BuildOutbound(cred, method)!;
+        JsonArray outbounds;
+        JsonArray? endpoints = null;
+        string finalTag;
 
-        var outbounds = new JsonArray
-        {
-            proxyOutbound,
-            new JsonObject { ["type"] = "direct", ["tag"] = "direct" }
-        };
         if (method.Id == "C02")
         {
-            outbounds.Insert(1, BuildShadowTlsOutbound(cred));
+            outbounds = new JsonArray
+            {
+                BuildSsOverShadowTls(cred),
+                BuildShadowTlsOutbound(cred),
+                new JsonObject { ["type"] = "direct", ["tag"] = "direct" }
+            };
+            finalTag = "proxy";
         }
-
-        // WireGuard / OpenVPN use endpoints on client too
-        JsonArray? endpoints = null;
-        if (method.Id is "E04" or "F03" or "F04")
+        else if (method.Id is "E04" or "F03" or "F04")
         {
             endpoints = new JsonArray { BuildClientEndpoint(cred, method) };
-            // route via endpoint tag
             outbounds = new JsonArray
             {
                 new JsonObject { ["type"] = "direct", ["tag"] = "direct" }
             };
+            finalTag = method.Id;
+        }
+        else
+        {
+            var outbound = BuildOutbound(cred, method)
+                ?? throw new InvalidOperationException($"No outbound builder for {method.Id}");
+            outbounds = new JsonArray
+            {
+                outbound,
+                new JsonObject { ["type"] = "direct", ["tag"] = "direct" }
+            };
+            finalTag = "proxy";
         }
 
         var root = new JsonObject
@@ -108,7 +133,7 @@ public static class ConfigFactory
             ["route"] = new JsonObject
             {
                 ["auto_detect_interface"] = true,
-                ["final"] = method.Id is "E04" or "F03" or "F04" ? method.Id : "proxy",
+                ["final"] = finalTag,
                 ["default_domain_resolver"] = "local"
             },
             ["dns"] = new JsonObject
@@ -250,6 +275,7 @@ public static class ConfigFactory
                 ["uuid"] = c.tuic_uuid,
                 ["password"] = c.trojan_password,
                 ["congestion_control"] = "bbr",
+                ["udp_relay_mode"] = "native",
                 ["tls"] = new JsonObject
                 {
                     ["enabled"] = true,
@@ -258,8 +284,8 @@ public static class ConfigFactory
                     ["certificate_path"] = AppPaths.CaCertPath.Replace('\\', '/')
                 }
             },
-            "E04" or "F03" or "F04" => null, // endpoints
-            "C02" => null, // special chain
+            "E04" or "F03" or "F04" or "C02" => null,
+            "F01" or "F02" => null,
             _ => null
         };
 
@@ -373,6 +399,7 @@ public static class ConfigFactory
         {
             ["type"] = "openvpn-client",
             ["tag"] = m.Id,
+            ["mode"] = "tls",
             ["system"] = false,
             ["network"] = network,
             ["server"] = c.server_ip,
@@ -382,7 +409,8 @@ public static class ConfigFactory
             ["tls"] = new JsonObject
             {
                 ["certificate_path"] = AppPaths.CaCertPath.Replace('\\', '/'),
-                // lab uses user/pass; server verify_client_certificate=none
+                ["client_certificate_path"] = AppPaths.ClientCertPath.Replace('\\', '/'),
+                ["client_key_path"] = AppPaths.ClientKeyPath.Replace('\\', '/')
             }
         };
     }

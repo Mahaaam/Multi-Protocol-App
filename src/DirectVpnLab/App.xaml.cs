@@ -1,5 +1,6 @@
 ﻿using System.Threading;
 using System.Windows;
+using DirectVpnLab.Services;
 
 namespace DirectVpnLab;
 
@@ -19,6 +20,20 @@ public partial class App : Application
                 MessageBoxButton.OK,
                 MessageBoxImage.Warning);
             Shutdown(1);
+            return;
+        }
+
+        // requireAdministrator manifest triggers UAC; soft-check if somehow not elevated
+        if (!ConnectionService.IsAdministrator())
+        {
+            MessageBox.Show(
+                "Direct VPN Lab requires Administrator privileges for TUN.\n" +
+                "برنامه برای TUN به دسترسی Administrator نیاز دارد.\n" +
+                "UAC elevation was denied or unavailable.",
+                "Direct VPN Lab",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+            Shutdown(2);
             return;
         }
 

@@ -61,7 +61,7 @@ public sealed partial class LiveLogService
     internal static string Sanitize(string message)
     {
         if (string.IsNullOrEmpty(message)) return message;
-        var m = message;
+        var m = StripAnsi(message);
 
         // key=value / key: value for sensitive keys
         m = SensitiveKvRegex().Replace(m, "$1=[REDACTED]");
@@ -73,6 +73,12 @@ public sealed partial class LiveLogService
         m = BearerRegex().Replace(m, "Bearer [REDACTED]");
         return m;
     }
+
+    private static string StripAnsi(string input) =>
+        AnsiRegex().Replace(input, "");
+
+    [GeneratedRegex(@"\x1B\[[0-9;]*[mK]|\x1B\][^\x07]*\x07|\x1B[@-Z\\-_]", RegexOptions.Compiled)]
+    private static partial Regex AnsiRegex();
 
     [GeneratedRegex(
         @"(?i)\b(password|passwd|pwd|token|secret|credential|api[_-]?key|private[_-]?key|privateKey|uuid|authorization)\b\s*([:=]\s*)([^\s,;""']+)",

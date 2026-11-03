@@ -47,14 +47,20 @@ public static class ProtocolCatalog
             new ProtocolMethod
             {
                 Id = "F01", Protocol = "MASQUE", Transport = "HTTP/2", Port = 0, Network = "tcp",
-                SkipReason = cred.skipped.GetValueOrDefault("F01_masque_h2", "Requires sing-box >= 1.15.0"),
-                Status = TestStatus.Skipped
+                SkipReason = cred.skipped.GetValueOrDefault("F01_masque_h2",
+                    "Unsupported: MASQUE requires sing-box >= 1.15.0 (current engine 1.14.4)"),
+                Status = TestStatus.Skipped,
+                FailureKind = FailureKind.Unsupported,
+                LastError = "Unsupported on sing-box 1.14.4"
             },
             new ProtocolMethod
             {
                 Id = "F02", Protocol = "MASQUE", Transport = "HTTP/3", Port = 0, Network = "udp",
-                SkipReason = cred.skipped.GetValueOrDefault("F02_masque_h3", "Requires sing-box >= 1.15.0"),
-                Status = TestStatus.Skipped
+                SkipReason = cred.skipped.GetValueOrDefault("F02_masque_h3",
+                    "Unsupported: MASQUE requires sing-box >= 1.15.0 (current engine 1.14.4)"),
+                Status = TestStatus.Skipped,
+                FailureKind = FailureKind.Unsupported,
+                LastError = "Unsupported on sing-box 1.14.4"
             },
             M("F03", "OpenVPN", "TCP", p, "F03_openvpn_tcp", "tcp"),
             M("F04", "OpenVPN", "UDP", p, "F04_openvpn_udp", "udp"),

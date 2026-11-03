@@ -68,6 +68,13 @@ public sealed class ConnectionService
         IEnumerable<ProtocolMethod> rankedPass,
         CancellationToken ct)
     {
+        var fatal = CheckFatalPrerequisites();
+        if (fatal != null)
+        {
+            _log.Fail(fatal);
+            return (false, fatal);
+        }
+
         var candidates = rankedPass
             .Where(m => m.Status == TestStatus.Pass)
             .OrderBy(m => m.Rank == 0 ? int.MaxValue : m.Rank)
@@ -76,14 +83,26 @@ public sealed class ConnectionService
 
         if (candidates.Count == 0)
         {
-            return (false, "CONNECTION FAILED - no PASS methods available");
+            return (false, "CONNECTION FAILED - no PASS methods available. Run TEST ALL first.");
         }
 
         WarnIfOtherVpn();
 
+        string? lastFail = null;
         foreach (var m in candidates)
         {
             ct.ThrowIfCancellationRequested();
+
+            // Re-check fatal gates between candidates (admin revoked, wintun removed)
+            fatal = CheckFatalPrerequisites();
+            if (fatal != null)
+            {
+                _log.Fail(fatal);
+                _verifiedConnected = false;
+                _pathVerified = false;
+                return (false, fatal);
+            }
+
             _log.Info($"Starting Windows tunnel with {m.Id} {m.DisplayName}");
             await CleanupTunnelAsync(verifyInternetRestored: false);
             var (ok, msg) = await TryConnectMethodAsync(m, ct);
@@ -93,15 +112,56 @@ public sealed class ConnectionService
                 _verifiedConnected = true;
                 return (true, msg);
             }
-            _log.Warn($"Tunnel candidate failed: {m.Id} - {msg}");
+
+            lastFail = $"{m.Id}: {msg}";
+            _log.Warn($"Tunnel candidate failed: {lastFail}");
             _verifiedConnected = false;
             _pathVerified = false;
             await CleanupTunnelAsync(verifyInternetRestored: false);
+
+            // Fatal class errors stop the whole cascade
+            if (IsFatalConnectError(msg))
+            {
+                return (false, msg);
+            }
         }
 
         _verifiedConnected = false;
         _pathVerified = false;
-        return (false, "CONNECTION FAILED");
+        return (false, lastFail != null
+            ? $"CONNECTION FAILED — last error: {lastFail}"
+            : "CONNECTION FAILED");
+    }
+
+    public string? CheckFatalPrerequisites()
+    {
+        if (!IsAdministrator())
+        {
+            return "Windows Permission Error — Administrator required for TUN. UAC elevation was denied or unavailable.";
+        }
+
+        if (!File.Exists(AppPaths.WintunDll) && !File.Exists(Path.Combine(
+                Path.GetDirectoryName(AppPaths.SingBoxExe) ?? "", "wintun.dll")))
+        {
+            return "TUN Driver Error — wintun.dll missing from application package.";
+        }
+
+        if (!File.Exists(AppPaths.SingBoxExe))
+        {
+            return "Engine Error — sing-box.exe missing.";
+        }
+
+        return null;
+    }
+
+    private static bool IsFatalConnectError(string msg)
+    {
+        var d = msg.ToLowerInvariant();
+        return d.Contains("administrator") ||
+               d.Contains("permission") ||
+               d.Contains("wintun") ||
+               d.Contains("tun driver") ||
+               d.Contains("elevation");
     }
 
     public async Task<(bool ok, string message)> DisconnectAsync()
