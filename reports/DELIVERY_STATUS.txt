@@ -1,0 +1,21 @@
+Direct VPN Lab — Delivery Status (2026-11-03)
+============================================
+SERVER_CONFIGURED
+SERVER_VERIFIED          (lab service active; existing Outline/WG/Iran-link paths left untouched)
+WINDOWS_APP_BUILT        (local publish/ and publish-standalone/ — not stored in git)
+WINDOWS_TUN_VERIFIED     PENDING (requires Administrator run of EXE on workstation)
+DIRECT_PROXY_VERIFIED    YES from Windows client (multiple methods; HTTPS + exit IP check)
+DIRECT_VPN_VERIFIED      PENDING (full-system TUN stage not completed in delivery)
+IRAN_NETWORK_TEST_PENDING / PARTIAL
+  Probes were run from the operator Windows machine. Formal country attribution
+  (public IP geo evidence) was not finalized in this delivery package.
+DIRECT_CONNECTION_FROM_IRAN_CONFIRMED  NOT YET
+NEW_SERVER_REQUIRED      NO
+
+SSH host key fingerprint (public):
+  ssh-ed25519 SHA256:jLcgyAhu5Td3LNsG2KPShob8grvq5cOYFrVV0h1yGFU
+
+Notes:
+- Proxy PASS means local mixed inbound forced HTTPS through the tested outbound
+  and exit IP matched the lab server.
+- Proxy PASS is NOT the same as Windows TUN / system-wide VPN PASS.

@@ -1,28 +1,55 @@
-# Direct VPN Lab
-node_modules/
-dist/
-bin/
-obj/
+# Build / publish
+**/bin/
+**/obj/
 publish/
+publish-standalone/
+dist/
+out/
 *.user
+*.suo
+*.cache
+.vs/
+
+# Secrets & local credentials (NEVER commit)
 .env
 .env.*
 !.env.example
-TMP/
-**/certificates/
-**/private/
-**/*.key
-**/credentials*
-**/Assets/certs/
+**/.env
+**/secrets/
 server/secrets/
 client/secrets/
-*.pem
-.DS_Store
-# Keep tracked app source; ignore local build outputs and bundled secrets/binaries
-src/DirectVpnLab/bin/
-src/DirectVpnLab/obj/
-src/DirectVpnLab/Assets/sing-box/
-publish/
-publish-standalone/
+**/Assets/certs/
+**/certificates/
+**/private/
+**/*credentials*.json
+!**/*credentials*.example.json
+**/*.key
+**/*.pem
+**/*.p12
+**/*.pfx
+**/ca.crt
+**/server.crt
+**/client.crt
+**/client.key
+
+# Binaries / large runtime assets
 *.exe
-!**/sing-box.exe
+*.dll
+!wintun.dll.placeholder
+**/Assets/sing-box/
+TMP/
+tmp/
+*.log
+*.pdb
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Local test configs that may contain live secrets
+TMP/proto-verify/
+**/test-*.json
+!samples/**/*.json

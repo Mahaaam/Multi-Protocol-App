@@ -1,0 +1,35 @@
+Methods matrix (client probe via local mixed proxy → HTTPS + exit IP)
+Date context: 2026-11-03
+Server lab ports: 40101–40152 range
+Exit IP expected: lab server public IPv4
+
+A01 VLESS+REALITY           PASS   (HTTPS + exit IP verified)
+A02 VLESS+TLS               PASS
+A03 VLESS+WS+TLS            PASS
+A04 VLESS+gRPC+TLS          INSTALLED_NOT_BATCH_PROBED
+A05 VLESS+HTTPUpgrade+TLS   INSTALLED_NOT_BATCH_PROBED
+B01 Trojan+TLS              PASS
+B02 Trojan+WS+TLS           INSTALLED_NOT_BATCH_PROBED
+B03 Trojan+gRPC+TLS         INSTALLED_NOT_BATCH_PROBED
+B04 VMess+TCP+TLS           PASS
+B05 VMess+WS+TLS            INSTALLED_NOT_BATCH_PROBED
+B06 VMess+gRPC+TLS          INSTALLED_NOT_BATCH_PROBED
+C01 Shadowsocks AEAD2022    PASS
+C02 SS+ShadowTLS v3         INSTALLED_NOT_BATCH_PROBED
+C03 AnyTLS                  PASS
+D01 Naive HTTP/2            INSTALLED_NOT_BATCH_PROBED
+D02 Naive QUIC              INSTALLED_NOT_BATCH_PROBED
+E01 Hysteria2               FAIL   (UDP path: no HTTPS response in probe window)
+E02 Hysteria2+obfs          INSTALLED / likely same UDP constraint
+E03 TUIC                    FAIL   (UDP path: no HTTPS response in probe window)
+E04 WireGuard Endpoint      UNVERIFIED (needs TUN/endpoint stage)
+F01 MASQUE H2               SKIPPED (requires sing-box >= 1.15.0; lab stable is 1.14.4)
+F02 MASQUE H3               SKIPPED (requires sing-box >= 1.15.0; lab stable is 1.14.4)
+F03 OpenVPN TCP             UNVERIFIED (needs endpoint/TUN stage)
+F04 OpenVPN UDP             UNVERIFIED (needs endpoint/TUN stage)
+
+Interpretation rules:
+- FAIL is recorded for this client network + server IP + port only.
+- FAIL alone is not proof of national filtering.
+- INSTALLED_NOT_BATCH_PROBED means server inbound exists but was not in the
+  automated batch that produced PASS/FAIL evidence above.

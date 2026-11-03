@@ -1,0 +1,25 @@
+Server changes (additive / isolated lab only)
+============================================
+
+Added:
+- System user: dvpnlab
+- Path: /opt/direct-vpn-lab/{bin,config,certificates,logs,scripts,state}
+- Binary: sing-box 1.14.4 linux-amd64
+  sha256: 699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968
+- systemd unit: direct-vpn-lab.service
+- nft table: inet direct_vpn_lab (priority 10; accept lab ports 40101-40152)
+- Lab listen ports: TCP/UDP in 40101–40152 range
+
+Explicitly NOT modified:
+- Outline / Shadowbox / Outline Docker containers or networks
+- Existing WireGuard interfaces (wg0/wg1/wg2/wg-nb-us) and configs
+- Existing Iran-link tunnel process (aiden-tunnel)
+- nginx / xray-front
+- Default IPv4 route
+- SSH daemon / SSH port
+- Shared sysctl beyond pre-existing state
+- iptables/nft flush of pre-existing tables
+
+Uninstall (lab only):
+  bash /opt/direct-vpn-lab/scripts/uninstall.sh
+  # mirrored in repo as server/scripts/uninstall-direct-vpn-lab.sh
