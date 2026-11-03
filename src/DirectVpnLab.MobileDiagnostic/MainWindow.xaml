@@ -1,0 +1,87 @@
+<Window x:Class="DirectVpnLab.MobileDiagnostic.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Direct VPN Lab — Mobile C01 Diagnostic"
+        Height="640" Width="820"
+        MinHeight="560" MinWidth="720"
+        Background="#1E1F22" Foreground="#E8E8E8"
+        WindowStartupLocation="CenterScreen">
+  <DockPanel Margin="16">
+    <TextBlock DockPanel.Dock="Top" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,12"
+               Text="Mobile C01 Diagnostic (PROXY ONLY — no TUN / no Cursor)"/>
+
+    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Margin="0,12,0,0">
+      <Button x:Name="BtnCheck" Content="CHECK NETWORK" Width="140" Height="36" Margin="0,0,8,0" Click="Check_Click"/>
+      <Button x:Name="BtnStart" Content="START C01 TEST" Width="140" Height="36" Margin="0,0,8,0" Click="Start_Click" IsEnabled="False"/>
+      <Button x:Name="BtnSave" Content="SAVE REPORT" Width="120" Height="36" Margin="0,0,8,0" Click="Save_Click" IsEnabled="False"/>
+      <Button x:Name="BtnCancel" Content="CANCEL" Width="100" Height="36" Click="Cancel_Click"/>
+      <TextBlock x:Name="TxtHint" VerticalAlignment="Center" Margin="16,0,0,0" Opacity="0.75"
+                 Text="1) CHECK  2) Deactivate WG  3) CHECK again  4) START  5) SAVE  6) Activate WG"/>
+    </StackPanel>
+
+    <Grid>
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="1.2*"/>
+        <ColumnDefinition Width="16"/>
+        <ColumnDefinition Width="*"/>
+      </Grid.ColumnDefinitions>
+
+      <Border Grid.Column="0" Background="#2B2D31" Padding="12" CornerRadius="4">
+        <Grid>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="170"/>
+            <ColumnDefinition Width="*"/>
+          </Grid.ColumnDefinitions>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+
+          <TextBlock Grid.Row="0" Grid.Column="0" Text="Network Adapter" Opacity="0.7" Margin="0,0,0,8"/>
+          <TextBlock Grid.Row="0" Grid.Column="1" x:Name="ValAdapter" Text="—" TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+          <TextBlock Grid.Row="1" Grid.Column="0" Text="Default Route" Opacity="0.7" Margin="0,0,0,8"/>
+          <TextBlock Grid.Row="1" Grid.Column="1" x:Name="ValRoute" Text="—" TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+          <TextBlock Grid.Row="2" Grid.Column="0" Text="Public IPv4" Opacity="0.7" Margin="0,0,0,8"/>
+          <TextBlock Grid.Row="2" Grid.Column="1" x:Name="ValPublicIp" Text="—" TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+          <TextBlock Grid.Row="3" Grid.Column="0" Text="Mobile Network" Opacity="0.7" Margin="0,0,0,8"/>
+          <TextBlock Grid.Row="3" Grid.Column="1" x:Name="ValMobile" Text="—" TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+          <TextBlock Grid.Row="4" Grid.Column="0" Text="Server TCP Status" Opacity="0.7" Margin="0,0,0,8"/>
+          <TextBlock Grid.Row="4" Grid.Column="1" x:Name="ValTcp" Text="—" TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+          <TextBlock Grid.Row="5" Grid.Column="0" Text="Proxy Exit IP" Opacity="0.7" Margin="0,0,0,8"/>
+          <TextBlock Grid.Row="5" Grid.Column="1" x:Name="ValExitIp" Text="—" TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+          <TextBlock Grid.Row="6" Grid.Column="0" Text="Download Progress" Opacity="0.7" Margin="0,0,0,8"/>
+          <TextBlock Grid.Row="6" Grid.Column="1" x:Name="ValProgress" Text="—" Margin="0,0,0,8"/>
+
+          <TextBlock Grid.Row="7" Grid.Column="0" Text="Download Speed" Opacity="0.7" Margin="0,0,0,8"/>
+          <TextBlock Grid.Row="7" Grid.Column="1" x:Name="ValSpeed" Text="—" Margin="0,0,0,8"/>
+
+          <TextBlock Grid.Row="8" Grid.Column="0" Text="Download Status" Opacity="0.7" Margin="0,0,0,8"/>
+          <TextBlock Grid.Row="8" Grid.Column="1" x:Name="ValDlStatus" Text="—" TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+          <TextBlock Grid.Row="9" Grid.Column="0" Text="Cleanup Status" Opacity="0.7" Margin="0,0,0,8"/>
+          <TextBlock Grid.Row="9" Grid.Column="1" x:Name="ValCleanup" Text="—" TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+          <TextBlock Grid.Row="10" Grid.Column="0" Text="Phase" Opacity="0.7"/>
+          <TextBlock Grid.Row="10" Grid.Column="1" x:Name="ValPhase" Text="Idle" TextWrapping="Wrap"/>
+        </Grid>
+      </Border>
+
+      <Border Grid.Column="2" Background="#2B2D31" Padding="8" CornerRadius="4">
+        <DockPanel>
+          <TextBlock DockPanel.Dock="Top" Text="Log" FontWeight="SemiBold" Margin="4,0,0,6"/>
+          <ListBox x:Name="LogList" Background="#1E1F22" Foreground="#D0D0D0" BorderThickness="0"
+                   ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                   FontFamily="Consolas" FontSize="11"/>
+        </DockPanel>
+      </Border>
+    </Grid>
+  </DockPanel>
+</Window>

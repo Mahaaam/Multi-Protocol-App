@@ -58,7 +58,7 @@ public sealed partial class LiveLogService
         }
     }
 
-    internal static string Sanitize(string message)
+    public static string Sanitize(string message)
     {
         if (string.IsNullOrEmpty(message)) return message;
         var m = StripAnsi(message);

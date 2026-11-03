@@ -1,0 +1,6 @@
+<Application x:Class="DirectVpnLab.MobileDiagnostic.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Startup="App_OnStartup">
+  <Application.Resources/>
+</Application>

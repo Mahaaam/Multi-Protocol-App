@@ -33,6 +33,9 @@ public sealed class ProxyTunCompareDiagnostic
     private readonly LabCredentials _cred;
     private readonly ConnectionService _connection;
 
+    /// <summary>Optional UI hook: mode, bytesReceived, targetBytes, elapsedMs.</summary>
+    public Action<string, long, long, double>? OnTransferProgress { get; set; }
+
     public ProxyTunCompareDiagnostic(LiveLogService log, LabCredentials cred, ConnectionService connection)
     {
         _log = log;
@@ -766,6 +769,7 @@ public sealed class ProxyTunCompareDiagnostic
                     if (firstByteMs == null) firstByteMs = sw.Elapsed.TotalMilliseconds;
                     got += n;
                     lastProgressMs = sw.Elapsed.TotalMilliseconds;
+                    OnTransferProgress?.Invoke(mode, got, TargetBytes, sw.Elapsed.TotalMilliseconds);
                 }
 
                 if (downloadStatus == "NOT_RUN")

@@ -1,0 +1,73 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AssemblyName>DirectVpnLab-Mobile-Diagnostic</AssemblyName>
+    <RootNamespace>DirectVpnLab.MobileDiagnostic</RootNamespace>
+    <Product>Direct VPN Lab Mobile Diagnostic</Product>
+    <Version>1.1.10</Version>
+    <InformationalVersion>1.1.10-mobile-diag</InformationalVersion>
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="9.0.0" />
+  </ItemGroup>
+
+  <!-- Reuse Lab services/models — no duplicate network stack -->
+  <ItemGroup>
+    <Compile Include="..\DirectVpnLab\Models\ProtocolMethod.cs" Link="Shared\Models\ProtocolMethod.cs" />
+    <Compile Include="..\DirectVpnLab\Services\Paths.cs" Link="Shared\Services\Paths.cs" />
+    <Compile Include="..\DirectVpnLab\Services\LiveLogService.cs" Link="Shared\Services\LiveLogService.cs" />
+    <Compile Include="..\DirectVpnLab\Services\SingBoxProcess.cs" Link="Shared\Services\SingBoxProcess.cs" />
+    <Compile Include="..\DirectVpnLab\Services\ConfigFactory.cs" Link="Shared\Services\ConfigFactory.cs" />
+    <Compile Include="..\DirectVpnLab\Services\ProtocolCatalog.cs" Link="Shared\Services\ProtocolCatalog.cs" />
+    <Compile Include="..\DirectVpnLab\Services\PersistenceService.cs" Link="Shared\Services\PersistenceService.cs" />
+    <Compile Include="..\DirectVpnLab\Services\ConnectionService.cs" Link="Shared\Services\ConnectionService.cs" />
+    <Compile Include="..\DirectVpnLab\Services\ProxyTunCompareDiagnostic.cs" Link="Shared\Services\ProxyTunCompareDiagnostic.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\DirectVpnLab\Assets\sing-box\sing-box.exe">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>Assets\sing-box\sing-box.exe</TargetPath>
+      <Link>Assets\sing-box\sing-box.exe</Link>
+    </None>
+    <None Include="..\DirectVpnLab\Assets\sing-box\wintun.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>Assets\sing-box\wintun.dll</TargetPath>
+      <Link>Assets\sing-box\wintun.dll</Link>
+    </None>
+    <None Include="..\DirectVpnLab\Assets\sing-box\libcronet.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>Assets\sing-box\libcronet.dll</TargetPath>
+      <Link>Assets\sing-box\libcronet.dll</Link>
+    </None>
+    <None Include="..\DirectVpnLab\Assets\certs\ca.crt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>Assets\certs\ca.crt</TargetPath>
+      <Link>Assets\certs\ca.crt</Link>
+    </None>
+    <None Include="..\DirectVpnLab\Assets\certs\credentials.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>Assets\certs\credentials.json</TargetPath>
+      <Link>Assets\certs\credentials.json</Link>
+    </None>
+    <None Include="..\DirectVpnLab\Assets\certs\client.crt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>Assets\certs\client.crt</TargetPath>
+      <Link>Assets\certs\client.crt</Link>
+    </None>
+    <None Include="..\DirectVpnLab\Assets\certs\client.key">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>Assets\certs\client.key</TargetPath>
+      <Link>Assets\certs\client.key</Link>
+    </None>
+  </ItemGroup>
+
+</Project>

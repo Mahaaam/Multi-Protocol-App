@@ -3,6 +3,8 @@
 **/obj/
 publish/
 publish-standalone/
+MobileDiagnosticPublish/
+MobileDiagnosticReports/
 dist/
 out/
 *.user
