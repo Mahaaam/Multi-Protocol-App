@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Windows;
 using DirectVpnLab.Services;
 
@@ -10,6 +11,8 @@ public partial class MainWindow : Window
     private PathCheckResult? _lastPath;
     private CancellationTokenSource? _runCts;
     private bool _busy;
+    private bool _closeAllowed;
+    private bool _closeCleanupStarted;
 
     public MainWindow()
     {
@@ -17,10 +20,7 @@ public partial class MainWindow : Window
         _log = new LiveLogService(Dispatcher);
         _engine = new MobileDiagnosticEngine(_log);
         _log.Changed += () => Dispatcher.BeginInvoke(SyncLog);
-        Closing += (_, _) =>
-        {
-            try { _engine.CancelAndCleanupAsync().GetAwaiter().GetResult(); } catch { /* ignore on close */ }
-        };
+        Closing += OnClosingLifecycle;
         try
         {
             _engine.EnsureReady();
@@ -34,6 +34,69 @@ public partial class MainWindow : Window
         {
             _log.Error(ex.Message);
             MessageBox.Show(this, ex.Message, "Startup", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private void OnClosingLifecycle(object? sender, CancelEventArgs e)
+    {
+        if (_closeAllowed)
+            return;
+
+        // Cancel close now; finish cleanup asynchronously, then Close() once.
+        e.Cancel = true;
+        if (_closeCleanupStarted)
+            return;
+
+        _closeCleanupStarted = true;
+        _runCts?.Cancel();
+        ValPhase.Text = "Closing — cleanup in progress…";
+        _ = FinishCloseAsync();
+    }
+
+    private async Task FinishCloseAsync()
+    {
+        string cleanup;
+        try
+        {
+            cleanup = await _engine.CancelAndCleanupAsync().ConfigureAwait(true);
+            if (cleanup.StartsWith("FAIL", StringComparison.OrdinalIgnoreCase))
+            {
+                _log.Error("Close cleanup failed: " + cleanup);
+                ValCleanup.Text = cleanup;
+            }
+            else
+            {
+                _log.Info("Close cleanup: " + cleanup);
+                ValCleanup.Text = cleanup;
+            }
+
+            // If a run was in progress without finalize, persist CANCELLED partial for active runId.
+            if (_engine.ActiveRunId != null &&
+                _engine.LastReport != null &&
+                string.Equals(_engine.LastReport.Summary, "IN_PROGRESS — network test not finished",
+                    StringComparison.Ordinal))
+            {
+                _engine.FinalizeCurrentRun(
+                    summary: "CANCELLED — window closed before test finished",
+                    errorClassification: "CANCELLED",
+                    cleanupResult: cleanup,
+                    path: _lastPath,
+                    tcp: "NOT_RUN",
+                    direct: "NOT_RUN",
+                    proxy: "NOT_RUN",
+                    bytes: _engine.LastReport.BytesReceived);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Error("Close cleanup exception: " + ex.Message);
+            ValCleanup.Text = "FAIL: " + ex.Message;
+        }
+        finally
+        {
+            _closeAllowed = true;
+            // Safe re-entry: Closing will see _closeAllowed and proceed.
+            Close();
         }
     }
 
@@ -101,19 +164,34 @@ public partial class MainWindow : Window
         BtnSave.IsEnabled = false;
         ValPhase.Text = "Re-checking path before START…";
         _runCts = null;
+
+        // New run identity immediately — supersedes any previous report.
+        var begun = _engine.BeginRun(_lastPath);
+        _log.Info($"START runId={begun.RunId}");
+
         try
         {
-            // Fresh CHECK at START — ignore stale PathOk from earlier CHECK.
             await Task.Run(() => { _lastPath = _engine.CheckNetwork(); }).ConfigureAwait(true);
             var pathNow = _lastPath ?? throw new InvalidOperationException("path check returned null");
             ApplyPathToUi(pathNow);
             if (!pathNow.PathOk)
             {
+                var denied = _engine.FinalizeCurrentRun(
+                    summary: pathNow.MobileNetworkStatus,
+                    errorClassification: "PATH_NOT_DIRECT",
+                    cleanupResult: "n/a — test not started",
+                    path: pathNow,
+                    tcp: "NOT_RUN",
+                    direct: "NOT_RUN",
+                    proxy: "NOT_RUN",
+                    hypothesis: pathNow.BlockReason);
+                ApplyReportToUi(denied);
                 MessageBox.Show(this,
                     "Path not OK on re-check. Deactivate WG and confirm Wi-Fi/gateway to NL, then CHECK again.\n" +
                     pathNow.MobileNetworkStatus,
                     "Blocked", MessageBoxButton.OK, MessageBoxImage.Warning);
-                ValPhase.Text = "START blocked — path re-check failed";
+                ValPhase.Text = "START blocked — path re-check failed (report saved)";
+                BtnSave.IsEnabled = true;
                 return;
             }
 
@@ -126,7 +204,7 @@ public partial class MainWindow : Window
             _runCts = new CancellationTokenSource();
 
             var report = await _engine.RunC01TestAsync(
-                _lastPath,
+                pathNow,
                 status => Dispatcher.BeginInvoke(() => ValPhase.Text = status),
                 (got, target, mbps) => Dispatcher.BeginInvoke(() =>
                 {
@@ -135,31 +213,39 @@ public partial class MainWindow : Window
                 }),
                 _runCts.Token).ConfigureAwait(true);
 
-            ValTcp.Text = report.TcpConnectionResult;
-            ValExitIp.Text = string.IsNullOrWhiteSpace(report.ConfirmedExitIp) ? "—" : report.ConfirmedExitIp;
-            ValProgress.Text = $"{report.BytesReceived} / 262144";
-            ValDlStatus.Text = report.ProxyDownloadResult;
-            ValCleanup.Text = report.CleanupResult;
-            ValPhase.Text = report.Summary;
+            ApplyReportToUi(report);
             BtnSave.IsEnabled = true;
             _log.Info($"Saved auto report for {report.RunId}");
         }
         catch (OperationCanceledException)
         {
-            ValDlStatus.Text = "CANCELLED";
-            ValPhase.Text = "Cancelled";
             var clean = await _engine.CancelAndCleanupAsync().ConfigureAwait(true);
-            ValCleanup.Text = clean;
-            BtnSave.IsEnabled = _engine.LastReport != null;
+            var report = _engine.FinalizeCurrentRun(
+                summary: "CANCELLED — network test incomplete",
+                errorClassification: "CANCELLED",
+                cleanupResult: clean,
+                path: _lastPath,
+                tcp: "NOT_RUN",
+                direct: "NOT_RUN",
+                proxy: "NOT_RUN");
+            ApplyReportToUi(report);
+            BtnSave.IsEnabled = true;
         }
         catch (Exception ex)
         {
-            ValDlStatus.Text = "FAIL";
-            ValPhase.Text = ex.Message;
             _log.Error(ex.Message);
             var clean = await _engine.CancelAndCleanupAsync().ConfigureAwait(true);
-            ValCleanup.Text = clean;
-            BtnSave.IsEnabled = _engine.LastReport != null;
+            var report = _engine.FinalizeCurrentRun(
+                summary: "FAILURE — exception",
+                errorClassification: "EXCEPTION",
+                cleanupResult: clean,
+                path: _lastPath,
+                tcp: "NOT_RUN",
+                direct: "NOT_RUN",
+                proxy: "NOT_RUN",
+                hypothesis: LiveLogService.Sanitize(ex.Message));
+            ApplyReportToUi(report);
+            BtnSave.IsEnabled = true;
         }
         finally
         {
@@ -170,6 +256,16 @@ public partial class MainWindow : Window
         }
     }
 
+    private void ApplyReportToUi(MobileRunReport report)
+    {
+        ValTcp.Text = report.TcpConnectionResult;
+        ValExitIp.Text = string.IsNullOrWhiteSpace(report.ConfirmedExitIp) ? "—" : report.ConfirmedExitIp;
+        ValProgress.Text = $"{report.BytesReceived} / 262144";
+        ValDlStatus.Text = report.ProxyDownloadResult;
+        ValCleanup.Text = report.CleanupResult;
+        ValPhase.Text = report.Summary;
+    }
+
     private void Save_Click(object sender, RoutedEventArgs e)
     {
         try
@@ -177,7 +273,7 @@ public partial class MainWindow : Window
             var (json, txt) = _engine.SaveReport();
             _log.Info($"SAVE REPORT: {json}");
             _log.Info($"SAVE REPORT: {txt}");
-            ValPhase.Text = "Report saved";
+            ValPhase.Text = "Report saved (current run only)";
             MessageBox.Show(this, $"JSON:\n{json}\n\nTXT:\n{txt}", "Saved", MessageBoxButton.OK,
                 MessageBoxImage.Information);
         }
@@ -192,10 +288,28 @@ public partial class MainWindow : Window
         _runCts?.Cancel();
         var clean = await _engine.CancelAndCleanupAsync().ConfigureAwait(true);
         ValCleanup.Text = clean;
-        ValPhase.Text = "Cancel/cleanup requested";
-        _log.Warn("CANCEL — " + clean);
-        if (_engine.LastReport != null)
+        if (clean.StartsWith("FAIL", StringComparison.OrdinalIgnoreCase))
+            _log.Error("CANCEL cleanup failed: " + clean);
+        else
+            _log.Warn("CANCEL — " + clean);
+
+        if (_engine.ActiveRunId != null)
+        {
+            var report = _engine.FinalizeCurrentRun(
+                summary: "CANCELLED by user",
+                errorClassification: "CANCELLED",
+                cleanupResult: clean,
+                path: _lastPath,
+                tcp: "NOT_RUN",
+                direct: "NOT_RUN",
+                proxy: "NOT_RUN");
+            ApplyReportToUi(report);
             BtnSave.IsEnabled = true;
+        }
+        else
+        {
+            ValPhase.Text = "Cancel/cleanup requested (no active run)";
+        }
     }
 
     private void SetBusy(bool busy)

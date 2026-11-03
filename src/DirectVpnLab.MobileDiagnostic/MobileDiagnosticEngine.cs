@@ -76,7 +76,7 @@ public sealed class MobileRunReport
 /// </summary>
 public sealed class MobileDiagnosticEngine
 {
-    public const string AppVersion = "1.1.10-mobile-diag.2";
+    public const string AppVersion = "1.1.10-mobile-diag.3";
     public const string RuntimeFolderName = "DirectVpnLab.MobileDiagnostic";
     public const string ServerIpDefault = "82.23.248.121";
     public const int ServerPortDefault = 40121;
@@ -106,13 +106,123 @@ public sealed class MobileDiagnosticEngine
     private LabCredentials? _cred;
     private ConnectionService? _connection;
     private MobileRunReport? _lastReport;
+    private string? _activeRunId;
+    private long _activeBytesReceived;
+    private int _cleanupGate;
+    private Task<string>? _cleanupInFlight;
 
     public MobileRunReport? LastReport => _lastReport;
+    public string? ActiveRunId => _activeRunId;
+    public bool HasCurrentRunReport => _lastReport != null &&
+                                       !string.IsNullOrWhiteSpace(_lastReport.RunId) &&
+                                       string.Equals(_lastReport.RunId, _activeRunId, StringComparison.Ordinal);
 
     public MobileDiagnosticEngine(LiveLogService log)
     {
         _log = log;
         ApplyIsolatedRuntime();
+    }
+
+    /// <summary>
+    /// Starts a new run identity immediately — replaces any previous report so SAVE cannot return stale data.
+    /// </summary>
+    public MobileRunReport BeginRun(PathCheckResult? path = null)
+    {
+        var started = DateTime.UtcNow;
+        var runId = $"mobile-c01-{started:yyyyMMddHHmmssfff}-{Guid.NewGuid().ToString("N")[..8]}";
+        _activeRunId = runId;
+        _activeBytesReceived = 0;
+        Interlocked.Exchange(ref _cleanupGate, 0);
+        _cleanupInFlight = null;
+
+        var report = new MobileRunReport
+        {
+            ApplicationVersion = AppVersion,
+            RunId = runId,
+            StartUtc = started,
+            EndUtc = started,
+            NetworkAdapter = path?.NetworkAdapter ?? "UNKNOWN",
+            EffectiveRoute = path?.EffectiveToServer ?? "UNKNOWN",
+            PublicIpv4 = path?.PublicIpv4 ?? "UNKNOWN",
+            TcpConnectionResult = "NOT_RUN",
+            DirectDownloadResult = "NOT_RUN",
+            ProxyDownloadResult = "NOT_RUN",
+            ConfirmedExitIp = "",
+            BytesReceived = 0,
+            StallDurationSeconds = null,
+            ErrorClassification = "",
+            CleanupResult = "NOT_RUN",
+            SingBoxLogExcerpt = "",
+            Summary = "IN_PROGRESS — network test not finished",
+            Hypothesis = "n/a",
+            Retransmission = "NOT_AVAILABLE",
+            AckInfo = "NOT_AVAILABLE"
+        };
+        _lastReport = report;
+        AutoSave(report);
+        _log.Info($"BeginRun {runId} (previous report superseded)");
+        return report;
+    }
+
+    public void NoteProgressBytes(long bytes) =>
+        _activeBytesReceived = Math.Max(_activeBytesReceived, bytes);
+
+    /// <summary>Persists partial/final outcome for the active runId only.</summary>
+    public MobileRunReport FinalizeCurrentRun(
+        string summary,
+        string errorClassification,
+        string cleanupResult,
+        PathCheckResult? path = null,
+        string? tcp = null,
+        string? direct = null,
+        string? proxy = null,
+        string? exitIp = null,
+        long? bytes = null,
+        double? stallSec = null,
+        string? hypothesis = null,
+        object? rawCompare = null,
+        IReadOnlyList<TcpSnapshot>? snapshots = null)
+    {
+        var runId = _activeRunId ?? $"orphan-{DateTime.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid().ToString("N")[..8]}";
+        var report = _lastReport;
+        if (report == null || !string.Equals(report.RunId, runId, StringComparison.Ordinal))
+        {
+            report = new MobileRunReport
+            {
+                ApplicationVersion = AppVersion,
+                RunId = runId,
+                StartUtc = DateTime.UtcNow
+            };
+        }
+
+        report.EndUtc = DateTime.UtcNow;
+        if (path != null)
+        {
+            report.NetworkAdapter = path.NetworkAdapter;
+            report.EffectiveRoute = path.EffectiveToServer;
+            report.PublicIpv4 = path.PublicIpv4;
+        }
+
+        if (tcp != null) report.TcpConnectionResult = tcp;
+        if (direct != null) report.DirectDownloadResult = direct;
+        if (proxy != null) report.ProxyDownloadResult = proxy;
+        if (exitIp != null) report.ConfirmedExitIp = exitIp;
+        report.BytesReceived = bytes ?? _activeBytesReceived;
+        if (stallSec.HasValue) report.StallDurationSeconds = stallSec;
+        report.ErrorClassification = errorClassification;
+        report.CleanupResult = cleanupResult;
+        report.Summary = summary;
+        if (hypothesis != null) report.Hypothesis = hypothesis;
+        if (rawCompare != null) report.RawCompare = rawCompare;
+        if (snapshots != null) report.TcpSnapshots = snapshots.ToList();
+        report.SingBoxLogExcerpt = ExtractRunLog(_log.ExportSanitized(), runId);
+        report.Retransmission = "NOT_AVAILABLE";
+        report.AckInfo = "NOT_AVAILABLE";
+
+        _lastReport = report;
+        _activeRunId = runId;
+        AutoSave(report);
+        return report;
     }
 
     public static void ApplyIsolatedRuntime()
@@ -293,28 +403,45 @@ public sealed class MobileDiagnosticEngine
     {
         EnsureReady();
 
+        // runId exists from BeginRun (caller) — if missing, create now so every START has an identity.
+        if (string.IsNullOrWhiteSpace(_activeRunId) || _lastReport == null)
+            BeginRun(path);
+
+        var runId = _activeRunId!;
+
         // Always re-validate path at START — stale CHECK must not run on wrong network.
         setStatus("Re-checking path…");
-        var fresh = CheckNetwork();
+        PathCheckResult fresh;
+        try
+        {
+            fresh = CheckNetwork();
+        }
+        catch (Exception ex)
+        {
+            var cleanFail = await CancelAndCleanupAsync().ConfigureAwait(false);
+            return FinalizeCurrentRun(
+                summary: "Path re-check threw before network test — NOT_RUN",
+                errorClassification: "PATH_CHECK_EXCEPTION",
+                cleanupResult: cleanFail,
+                path: path,
+                tcp: "NOT_RUN",
+                direct: "NOT_RUN",
+                proxy: "NOT_RUN",
+                hypothesis: LiveLogService.Sanitize(ex.Message));
+        }
+
         path = fresh;
         if (!path.PathOk)
         {
-            var denied = new MobileRunReport
-            {
-                ApplicationVersion = AppVersion,
-                RunId = $"denied-{DateTime.UtcNow:yyyyMMddHHmmss}",
-                StartUtc = DateTime.UtcNow,
-                EndUtc = DateTime.UtcNow,
-                NetworkAdapter = path.NetworkAdapter,
-                EffectiveRoute = path.EffectiveToServer,
-                PublicIpv4 = path.PublicIpv4,
-                ErrorClassification = "PATH_NOT_DIRECT",
-                Summary = path.MobileNetworkStatus,
-                CleanupResult = "n/a"
-            };
-            _lastReport = denied;
-            AutoSave(denied);
-            return denied;
+            return FinalizeCurrentRun(
+                summary: path.MobileNetworkStatus,
+                errorClassification: "PATH_NOT_DIRECT",
+                cleanupResult: "n/a — test not started",
+                path: path,
+                tcp: "NOT_RUN",
+                direct: "NOT_RUN",
+                proxy: "NOT_RUN",
+                hypothesis: path.BlockReason);
         }
 
         var cred = _cred!;
@@ -323,8 +450,6 @@ public sealed class MobileDiagnosticEngine
             .FirstOrDefault(m => m.Id == "C01")
             ?? throw new InvalidOperationException("C01 missing from catalog");
 
-        var started = DateTime.UtcNow;
-        var runId = $"mobile-c01-{started:yyyyMMddHHmmss}-{Guid.NewGuid().ToString("N")[..8]}";
         var serverIp = string.IsNullOrWhiteSpace(cred.server_ip) ? ServerIpDefault : cred.server_ip.Trim();
         var serverPort = c01.Port > 0 ? c01.Port : ServerPortDefault;
 
@@ -337,6 +462,7 @@ public sealed class MobileDiagnosticEngine
         {
             OnTransferProgress = (mode, got, target, elapsedMs) =>
             {
+                NoteProgressBytes(got);
                 var secs = Math.Max(elapsedMs / 1000.0, 0.001);
                 var mbps = got * 8.0 / secs / 1_000_000.0;
                 setProgress(got, target, mbps);
@@ -344,75 +470,150 @@ public sealed class MobileDiagnosticEngine
             }
         };
 
-        ProxyTunCompareDiagnostic.CompareReport compare;
+        string cleanupResult;
         try
         {
             setStatus("C01 PROXY-ONLY session…");
-            compare = await diag.RunProxyOnlySessionAsync(c01, ct).ConfigureAwait(false);
-        }
-        finally
-        {
-            snapCts.Cancel();
-            try { await snapTask.ConfigureAwait(false); } catch { /* ignore */ }
-            setStatus("Cleanup…");
-            try { await connection.DisconnectAsync().ConfigureAwait(false); } catch { /* ignore */ }
-        }
-
-        var proxy = compare.Proxy;
-        var stallSec = proxy.DownloadStatus is "STALL" or "TIMEOUT"
-            ? ProxyTunCompareDiagnostic.ProxyOnlyStallIdle.TotalSeconds
-            : (double?)null;
-
-        var report = new MobileRunReport
-        {
-            ApplicationVersion = AppVersion,
-            RunId = compare.RunId.Length > 0 ? compare.RunId : runId,
-            StartUtc = compare.StartedAtUtc == default ? started : compare.StartedAtUtc,
-            EndUtc = compare.FinishedAtUtc == default ? DateTime.UtcNow : compare.FinishedAtUtc,
-            NetworkAdapter = path.NetworkAdapter,
-            EffectiveRoute = path.EffectiveToServer,
-            PublicIpv4 = path.PublicIpv4,
-            TcpConnectionResult = proxy.TcpConnectStatus != "NOT_MEASURED"
-                ? $"{proxy.TcpConnectStatus}: {proxy.TcpConnectDetail}"
-                : compare.DirectBaseline?.TcpConnectStatus + ": " + compare.DirectBaseline?.TcpConnectDetail,
-            DirectDownloadResult = FormatLeg(compare.DirectBaseline),
-            ProxyDownloadResult = FormatLeg(proxy),
-            ConfirmedExitIp = proxy.ExitIp ?? "",
-            BytesReceived = proxy.BytesReceived,
-            StallDurationSeconds = stallSec,
-            ErrorClassification = proxy.ErrorCategory ?? proxy.DownloadCategory ?? "",
-            CleanupResult = compare.CleanupOk ? $"OK: {compare.CleanupDetail}" : $"FAIL: {compare.CleanupDetail}",
-            SingBoxLogExcerpt = ExtractRunLog(_log.ExportSanitized(), compare.RunId),
-            Summary = compare.Summary,
-            Hypothesis = compare.Hypothesis,
-            Retransmission = "NOT_AVAILABLE",
-            AckInfo = "NOT_AVAILABLE",
-            TcpSnapshots = snapshots,
-            RawCompare = new
+            ProxyTunCompareDiagnostic.CompareReport compare;
+            try
             {
-                compare.RunId,
-                compare.Summary,
-                compare.Hypothesis,
-                compare.Confidence,
-                proxyOutcome = proxy.Outcome,
-                proxyDownload = proxy.DownloadStatus,
-                proxyBytes = proxy.BytesReceived,
-                proxyExit = proxy.ExitIp,
-                proxyExitStatus = proxy.ExitIpStatus,
-                firstByteMs = proxy.FirstByteMs,
-                lastProgressMs = proxy.LastProgressMs,
-                totalMs = proxy.TotalMs,
-                mbps = proxy.Mbps
+                compare = await diag.RunProxyOnlySessionAsync(c01, ct).ConfigureAwait(false);
             }
-        };
+            catch (OperationCanceledException)
+            {
+                cleanupResult = await CancelAndCleanupAsync().ConfigureAwait(false);
+                return FinalizeCurrentRun(
+                    summary: "CANCELLED before/during PROXY-ONLY — partial evidence saved",
+                    errorClassification: "CANCELLED",
+                    cleanupResult: cleanupResult,
+                    path: path,
+                    tcp: "NOT_RUN",
+                    direct: "NOT_RUN",
+                    proxy: "CANCELLED",
+                    bytes: _activeBytesReceived,
+                    snapshots: snapshots,
+                    hypothesis: "User cancelled; unfinished legs = NOT_RUN/CANCELLED");
+            }
+            catch (Exception ex)
+            {
+                cleanupResult = await CancelAndCleanupAsync().ConfigureAwait(false);
+                return FinalizeCurrentRun(
+                    summary: "EXCEPTION during PROXY-ONLY — partial evidence saved",
+                    errorClassification: "EXCEPTION",
+                    cleanupResult: cleanupResult,
+                    path: path,
+                    tcp: "NOT_RUN",
+                    direct: "NOT_RUN",
+                    proxy: "NOT_RUN",
+                    bytes: _activeBytesReceived,
+                    snapshots: snapshots,
+                    hypothesis: LiveLogService.Sanitize(ex.Message));
+            }
+            finally
+            {
+                snapCts.Cancel();
+                try { await snapTask.ConfigureAwait(false); } catch { /* ignore */ }
+            }
 
-        _lastReport = report;
-        AutoSave(report);
-        setStatus(proxy.Outcome == "PASS" ? "DONE — PROXY PASS (not Full VPN PASS)" : $"DONE — {proxy.Outcome}/{proxy.DownloadStatus}");
-        return report;
+            setStatus("Cleanup…");
+            cleanupResult = await CancelAndCleanupAsync().ConfigureAwait(false);
+
+            var proxy = compare.Proxy;
+            var stallSec = proxy.DownloadStatus is "STALL" or "TIMEOUT"
+                ? ProxyTunCompareDiagnostic.ProxyOnlyStallIdle.TotalSeconds
+                : (double?)null;
+            NoteProgressBytes(proxy.BytesReceived);
+
+            var tcpText = proxy.TcpConnectStatus != "NOT_MEASURED"
+                ? $"{proxy.TcpConnectStatus}: {proxy.TcpConnectDetail}"
+                : (compare.DirectBaseline == null
+                    ? "NOT_RUN"
+                    : $"{compare.DirectBaseline.TcpConnectStatus}: {compare.DirectBaseline.TcpConnectDetail}");
+
+            var report = FinalizeCurrentRun(
+                summary: compare.Summary,
+                errorClassification: proxy.ErrorCategory ?? proxy.DownloadCategory ?? "",
+                cleanupResult: cleanupResult,
+                path: path,
+                tcp: tcpText,
+                direct: FormatLeg(compare.DirectBaseline),
+                proxy: FormatLeg(proxy),
+                exitIp: proxy.ExitIp ?? "",
+                bytes: proxy.BytesReceived,
+                stallSec: stallSec,
+                hypothesis: compare.Hypothesis,
+                snapshots: snapshots,
+                rawCompare: new
+                {
+                    engineRunId = runId,
+                    compare.RunId,
+                    compare.Summary,
+                    compare.Hypothesis,
+                    compare.Confidence,
+                    proxyOutcome = proxy.Outcome,
+                    proxyDownload = proxy.DownloadStatus,
+                    proxyBytes = proxy.BytesReceived,
+                    proxyExit = proxy.ExitIp,
+                    proxyExitStatus = proxy.ExitIpStatus,
+                    firstByteMs = proxy.FirstByteMs,
+                    lastProgressMs = proxy.LastProgressMs,
+                    totalMs = proxy.TotalMs,
+                    mbps = proxy.Mbps
+                });
+
+            // Prefer diagnostic runId in log extract but keep our BeginRun id as authority for SAVE.
+            if (!string.IsNullOrWhiteSpace(compare.RunId))
+                report.SingBoxLogExcerpt = ExtractRunLog(_log.ExportSanitized(), compare.RunId);
+
+            setStatus(proxy.Outcome == "PASS"
+                ? "DONE — PROXY PASS (not Full VPN PASS)"
+                : $"DONE — {proxy.Outcome}/{proxy.DownloadStatus}");
+            return report;
+        }
+        catch (OperationCanceledException)
+        {
+            cleanupResult = await CancelAndCleanupAsync().ConfigureAwait(false);
+            return FinalizeCurrentRun(
+                summary: "CANCELLED — network test incomplete",
+                errorClassification: "CANCELLED",
+                cleanupResult: cleanupResult,
+                path: path,
+                tcp: "NOT_RUN",
+                direct: "NOT_RUN",
+                proxy: "NOT_RUN",
+                bytes: _activeBytesReceived,
+                snapshots: snapshots,
+                hypothesis: "Cancelled before completion");
+        }
+        catch (Exception ex)
+        {
+            cleanupResult = await CancelAndCleanupAsync().ConfigureAwait(false);
+            return FinalizeCurrentRun(
+                summary: "FAILURE — exception after start",
+                errorClassification: "EXCEPTION",
+                cleanupResult: cleanupResult,
+                path: path,
+                tcp: "NOT_RUN",
+                direct: "NOT_RUN",
+                proxy: "NOT_RUN",
+                bytes: _activeBytesReceived,
+                snapshots: snapshots,
+                hypothesis: LiveLogService.Sanitize(ex.Message));
+        }
     }
 
-    public async Task<string> CancelAndCleanupAsync()
+    /// <summary>Single-flight cleanup for this tool only (no global sing-box kill).</summary>
+    public Task<string> CancelAndCleanupAsync()
+    {
+        if (Interlocked.CompareExchange(ref _cleanupGate, 1, 0) == 0)
+        {
+            _cleanupInFlight = CancelAndCleanupCoreAsync();
+        }
+
+        return _cleanupInFlight ?? Task.FromResult("OK: cleanup already finished");
+    }
+
+    private async Task<string> CancelAndCleanupCoreAsync()
     {
         try
         {
@@ -424,6 +625,8 @@ public sealed class MobileDiagnosticEngine
                 // DisconnectAsync only kills ownership recorded under THIS RuntimeDir/StateDir.
                 var (ok, msg) = await _connection.DisconnectAsync().ConfigureAwait(false);
                 parts.Add(ok ? $"disconnect:{msg}" : $"disconnect-FAIL:{msg}");
+                if (!ok)
+                    return "FAIL: " + string.Join("; ", parts);
             }
             else
             {
@@ -534,6 +737,23 @@ public sealed class MobileDiagnosticEngine
         Assert("workdir_not_main",
             !string.Equals(AppPaths.WorkDir, mainWork, StringComparison.OrdinalIgnoreCase));
 
+        // Report lifecycle: BeginRun supersedes previous; finalize keeps same runId; SAVE rejects stale
+        var log = new LiveLogService(System.Windows.Threading.Dispatcher.CurrentDispatcher);
+        var eng = new MobileDiagnosticEngine(log);
+        var r1 = eng.BeginRun();
+        var r2 = eng.BeginRun();
+        Assert("begin_run_supersedes", !string.Equals(r1.RunId, r2.RunId, StringComparison.Ordinal) &&
+                                       string.Equals(eng.LastReport!.RunId, r2.RunId, StringComparison.Ordinal));
+        var fin = eng.FinalizeCurrentRun("CANCELLED test", "CANCELLED", "OK: simulated",
+            tcp: "NOT_RUN", direct: "NOT_RUN", proxy: "CANCELLED", bytes: 1234);
+        Assert("finalize_keeps_runId", string.Equals(fin.RunId, r2.RunId, StringComparison.Ordinal) &&
+                                       fin.BytesReceived == 1234 &&
+                                       fin.TcpConnectionResult == "NOT_RUN");
+        var stale = r1;
+        var threw = false;
+        try { eng.SaveReport(stale); } catch (InvalidOperationException) { threw = true; }
+        Assert("save_rejects_stale", threw);
+
         lines.Add(fail == 0 ? "SAFETY_SELFTEST=PASS" : $"SAFETY_SELFTEST=FAIL count={fail}");
         return string.Join(Environment.NewLine, lines);
     }
@@ -555,7 +775,14 @@ public sealed class MobileDiagnosticEngine
 
     public (string jsonPath, string txtPath) SaveReport(MobileRunReport? report = null)
     {
-        report ??= _lastReport ?? throw new InvalidOperationException("No report to save — run CHECK/TEST first");
+        report ??= _lastReport ?? throw new InvalidOperationException("No report to save — run START first");
+        if (!string.IsNullOrWhiteSpace(_activeRunId) &&
+            !string.Equals(report.RunId, _activeRunId, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Refusing stale report {report.RunId}; current run is {_activeRunId}");
+        }
+
         return AutoSave(report);
     }
 
