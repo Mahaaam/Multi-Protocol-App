@@ -87,9 +87,16 @@ public partial class MainWindow : Window
         try
         {
             _cts?.Cancel();
-            await _connection.DisconnectAsync();
+            var (ok, msg) = await _connection.DisconnectAsync();
+            if (!ok)
+            {
+                _log.Fail($"Shutdown cleanup incomplete: {msg}");
+            }
+            else
+            {
+                _log.Info("Shutdown cleanup finished");
+            }
             _closingCleanupDone = true;
-            _log.Info("Shutdown cleanup finished");
             Close();
         }
         catch (Exception ex)
@@ -179,6 +186,12 @@ public partial class MainWindow : Window
     private async void TestAll_Click(object sender, RoutedEventArgs e)
     {
         if (_uiState is ConnectionUiState.Testing or ConnectionUiState.Connecting or ConnectionUiState.Degraded) return;
+        if (_connection.IsConnected || _uiState == ConnectionUiState.Connected)
+        {
+            _log.Warn("TEST ALL disabled while VPN Connected — discovery would be contaminated by the active tunnel");
+            return;
+        }
+
         _cts?.Cancel();
         _cts = new CancellationTokenSource();
         SetBusy(true);
@@ -213,6 +226,13 @@ public partial class MainWindow : Window
             }
             else
             {
+                if (!_connection.TunnelPathVerified)
+                {
+                    _log.Warn("VPN Speed Test blocked — tunnel path not verified");
+                    TxtSpeedVpn.Text = "VPN: BLOCKED — tunnel path not verified";
+                    return;
+                }
+
                 var p = _connection.ActiveMethod;
                 _vpnSpeed = await _speed.RunAsync("VPN", p?.DisplayName, null, CancellationToken.None);
                 TxtSpeedVpn.Text = FormatSpeed($"VPN ({p?.Protocol})", _vpnSpeed);
@@ -244,8 +264,14 @@ public partial class MainWindow : Window
     {
         _healthTimer.Stop();
         _cts?.Cancel();
-        await _connection.DisconnectAsync();
+        var (ok, msg) = await _connection.DisconnectAsync();
         ClearConnInfo();
+        if (!ok)
+        {
+            SetUiState(ConnectionUiState.Failed);
+            _log.Fail(msg);
+            return;
+        }
         SetUiState(ConnectionUiState.Disconnected);
     }
 
@@ -279,7 +305,14 @@ public partial class MainWindow : Window
             _log.Info("Attempting controlled recovery after cleanup of previous method");
 
             var ranked = _methods.Where(m => m.Status == TestStatus.Pass).OrderBy(m => m.Rank).ToList();
-            await _connection.DisconnectAsync();
+            var (discOk, discMsg) = await _connection.DisconnectAsync();
+            if (!discOk)
+            {
+                ClearConnInfo();
+                SetUiState(ConnectionUiState.Failed);
+                _log.Fail($"Recovery aborted — previous method cleanup failed: {discMsg}");
+                return;
+            }
 
             var (reOk, msg) = await _connection.ConnectBestAsync(ranked, CancellationToken.None);
             if (reOk && _connection.IsConnected)
@@ -349,7 +382,11 @@ public partial class MainWindow : Window
 
     private void SetBusy(bool busy)
     {
-        BtnTestAll.IsEnabled = !busy;
+        var vpnActive = _connection.IsConnected || _uiState == ConnectionUiState.Connected;
+        BtnTestAll.IsEnabled = !busy && !vpnActive;
+        BtnTestAll.ToolTip = vpnActive
+            ? "Disabled while Connected — discovery would use the active VPN path"
+            : "Run isolated protocol discovery";
         BtnSpeed.IsEnabled = !busy;
         BtnConnect.IsEnabled = !busy || _uiState == ConnectionUiState.Connected;
     }
@@ -360,6 +397,11 @@ public partial class MainWindow : Window
         TxtStatus.Text = state.ToString();
         TxtConnStatus.Text = $"Status: {state}";
         BtnDisconnect.IsEnabled = state is ConnectionUiState.Connected or ConnectionUiState.Degraded;
+        var vpnActive = state == ConnectionUiState.Connected || _connection.IsConnected;
+        BtnTestAll.IsEnabled = !vpnActive && state is not (ConnectionUiState.Testing or ConnectionUiState.Connecting or ConnectionUiState.Degraded);
+        BtnTestAll.ToolTip = vpnActive
+            ? "Disabled while Connected — discovery would use the active VPN path"
+            : "Run isolated protocol discovery";
 
         var ring = FindRing();
         var label = FindLabel();

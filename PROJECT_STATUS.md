@@ -90,6 +90,12 @@ specific results only.
 - Lifecycle: Closing waits for cleanup; orphan PID recovery; health-check overlap gate  
 - Speed Test: failed HTTP is not treated as Mbps=0 success  
 - Live Log: real secret redaction  
+- Baseline snapshot now includes routes (`netsh`) + DNS servers, not only adapters  
+- Disconnect verifies TUN gone, route no longer via DirectVpnLab, and direct internet probe  
+- Orphan kill requires exe path + start-time ownership proof (refuses unsafe kill)  
+- Connected green requires GetBestInterface path via DirectVpnLab  
+- TEST ALL disabled while Connected (avoids tunnel-contaminated discovery)  
+- VPN Speed Test blocked unless tunnel path verified  
 
 Operator must still manually verify VPN/TUN before any `VPN_VERIFIED` / final PASS claim.
 

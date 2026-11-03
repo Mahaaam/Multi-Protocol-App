@@ -16,6 +16,10 @@ public sealed class SingBoxProcess : IAsyncDisposable
 
     public bool IsRunning => _process is { HasExited: false };
     public int? ProcessId => _process is { HasExited: false } ? _process.Id : null;
+    public string? ExecutablePath { get; private set; }
+    public DateTime? StartedAtUtc { get; private set; }
+    public string? ConfigPath { get; private set; }
+
     public string StderrSnapshot
     {
         get
@@ -32,7 +36,6 @@ public sealed class SingBoxProcess : IAsyncDisposable
             throw new FileNotFoundException("sing-box.exe not found", AppPaths.SingBoxExe);
         }
 
-        // Ensure wintun beside sing-box for TUN
         var exeDir = Path.GetDirectoryName(AppPaths.SingBoxExe)!;
         var wintunTarget = Path.Combine(exeDir, "wintun.dll");
         if (!File.Exists(wintunTarget) && File.Exists(AppPaths.WintunDll))
@@ -40,10 +43,11 @@ public sealed class SingBoxProcess : IAsyncDisposable
             File.Copy(AppPaths.WintunDll, wintunTarget, true);
         }
 
+        ConfigPath = Path.GetFullPath(configPath);
         var psi = new ProcessStartInfo
         {
             FileName = AppPaths.SingBoxExe,
-            Arguments = $"run -c \"{configPath}\"",
+            Arguments = $"run -c \"{ConfigPath}\"",
             WorkingDirectory = exeDir,
             UseShellExecute = false,
             RedirectStandardOutput = true,
@@ -70,10 +74,20 @@ public sealed class SingBoxProcess : IAsyncDisposable
         {
             throw new InvalidOperationException("Failed to start sing-box");
         }
+
+        StartedAtUtc = DateTime.UtcNow;
+        try
+        {
+            ExecutablePath = Path.GetFullPath(_process.MainModule?.FileName ?? AppPaths.SingBoxExe);
+        }
+        catch
+        {
+            ExecutablePath = Path.GetFullPath(AppPaths.SingBoxExe);
+        }
+
         _process.BeginOutputReadLine();
         _process.BeginErrorReadLine();
 
-        // brief settle
         await Task.Delay(700, ct);
         if (_process.HasExited)
         {
@@ -85,6 +99,9 @@ public sealed class SingBoxProcess : IAsyncDisposable
     {
         var p = _process;
         _process = null;
+        ExecutablePath = null;
+        StartedAtUtc = null;
+        ConfigPath = null;
         if (p == null) return;
         try
         {

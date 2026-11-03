@@ -1,6 +1,9 @@
 using System.Diagnostics;
+using System.Net;
 using System.Net.Http;
 using System.Net.NetworkInformation;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using DirectVpnLab.Models;
 
@@ -15,11 +18,16 @@ public sealed class ConnectionService
     private SingBoxProcess? _tunProcess;
     private ProtocolMethod? _active;
     private bool _verifiedConnected;
+    private bool _pathVerified;
     private string? _netBeforePath;
+    private ProcessOwnership? _ownership;
 
     public ProtocolMethod? ActiveMethod => _active;
+    public bool TunnelPathVerified => _pathVerified;
+
     public bool IsConnected =>
         _verifiedConnected &&
+        _pathVerified &&
         _tunProcess?.IsRunning == true &&
         _active != null &&
         TunInterfaceUp();
@@ -33,20 +41,27 @@ public sealed class ConnectionService
     public async Task RecoverOrphansAsync()
     {
         var marker = Path.Combine(AppPaths.StateDir, "active-method.txt");
-        var pidFile = Path.Combine(AppPaths.StateDir, "tun-pid.txt");
-        if (!File.Exists(marker) && !File.Exists(pidFile))
+        var ownFile = OwnershipPath();
+        if (!File.Exists(marker) && !File.Exists(ownFile) && !File.Exists(Path.Combine(AppPaths.StateDir, "tun-pid.txt")))
         {
             return;
         }
 
         _log.Warn("Previous session marker found — recovering application-owned resources");
-        await KillOwnedSingBoxAsync();
+        var (killed, detail) = await KillOwnedSingBoxAsync();
+        if (!killed && !string.IsNullOrWhiteSpace(detail))
+        {
+            _log.Warn($"Orphan process handling: {detail}");
+        }
+
         TryDelete(marker);
-        TryDelete(pidFile);
+        TryDelete(ownFile);
+        TryDelete(Path.Combine(AppPaths.StateDir, "tun-pid.txt"));
         TryDelete(Path.Combine(AppPaths.StateDir, "net-before.json"));
         _verifiedConnected = false;
+        _pathVerified = false;
         _active = null;
-        _log.Info("Orphan cleanup completed for Direct VPN Lab resources");
+        _log.Info("Orphan cleanup finished for Direct VPN Lab markers");
     }
 
     public async Task<(bool ok, string message)> ConnectBestAsync(
@@ -70,7 +85,7 @@ public sealed class ConnectionService
         {
             ct.ThrowIfCancellationRequested();
             _log.Info($"Starting Windows tunnel with {m.Id} {m.DisplayName}");
-            await CleanupTunnelAsync();
+            await CleanupTunnelAsync(verifyInternetRestored: false);
             var (ok, msg) = await TryConnectMethodAsync(m, ct);
             if (ok)
             {
@@ -80,20 +95,30 @@ public sealed class ConnectionService
             }
             _log.Warn($"Tunnel candidate failed: {m.Id} - {msg}");
             _verifiedConnected = false;
-            await CleanupTunnelAsync();
+            _pathVerified = false;
+            await CleanupTunnelAsync(verifyInternetRestored: false);
         }
 
         _verifiedConnected = false;
+        _pathVerified = false;
         return (false, "CONNECTION FAILED");
     }
 
-    public async Task DisconnectAsync()
+    public async Task<(bool ok, string message)> DisconnectAsync()
     {
         _log.Info("Disconnect requested");
         _verifiedConnected = false;
-        await CleanupTunnelAsync();
+        _pathVerified = false;
+        var (cleanOk, cleanMsg) = await CleanupTunnelAsync(verifyInternetRestored: true);
         _active = null;
-        _log.Info("Disconnected - application-owned resources cleaned");
+        if (!cleanOk)
+        {
+            _log.Fail($"Disconnect cleanup incomplete: {cleanMsg}");
+            return (false, cleanMsg);
+        }
+
+        _log.Info("Disconnected - application-owned resources cleaned; normal path check OK");
+        return (true, "Disconnected and network cleanup verified");
     }
 
     private async Task<(bool ok, string message)> TryConnectMethodAsync(ProtocolMethod m, CancellationToken ct)
@@ -108,13 +133,20 @@ public sealed class ConnectionService
 
             _netBeforePath = Path.Combine(AppPaths.StateDir, "net-before.json");
             File.WriteAllText(_netBeforePath, CaptureNetSnapshotJson());
+            _log.Info("Captured baseline interfaces + routes + DNS");
 
             var cfg = ConfigFactory.BuildTunConfig(_cred, m, AppPaths.WorkDir);
             _tunProcess = new SingBoxProcess(_log);
             await _tunProcess.StartAsync(cfg, ct);
-            WritePidFile(_tunProcess.ProcessId);
+            _ownership = new ProcessOwnership
+            {
+                Pid = _tunProcess.ProcessId ?? 0,
+                ExePath = _tunProcess.ExecutablePath ?? Path.GetFullPath(AppPaths.SingBoxExe),
+                StartedAtUtc = _tunProcess.StartedAtUtc ?? DateTime.UtcNow,
+                ConfigPath = _tunProcess.ConfigPath ?? cfg
+            };
+            WriteOwnershipFile(_ownership);
 
-            // Allow TUN adapter to appear
             for (var i = 0; i < 10 && !TunInterfaceUp(); i++)
             {
                 await Task.Delay(300, ct);
@@ -126,23 +158,36 @@ public sealed class ConnectionService
             }
             _log.Info("TUN interface active: DirectVpnLab");
 
-            _log.Info("Checking DNS");
-            _log.Info("Verifying external connectivity via TUN (system proxy disabled)");
+            _log.Info("Verifying effective Windows route uses DirectVpnLab");
+            var (pathOk, pathDetail) = VerifyTrafficUsesTun(new[] { "1.1.1.1", "8.8.8.8" });
+            if (!pathOk)
+            {
+                _pathVerified = false;
+                return (false, $"Route Path Error: {pathDetail}");
+            }
+            _pathVerified = true;
+            _log.Info($"Effective route verified via DirectVpnLab ({pathDetail})");
 
+            _log.Info("Checking DNS / HTTPS via TUN (system proxy disabled)");
             var (httpsOk, exitIp, detail) = await VerifyInternetAsync(ct);
             if (!httpsOk)
             {
+                _pathVerified = false;
                 return (false, $"Internet Verification Failed: {detail}");
             }
 
             if (!IsExactExpectedExit(exitIp))
             {
+                _pathVerified = false;
                 return (false, $"Exit IP Mismatch: got {exitIp} expected {_cred.server_ip}");
             }
 
-            if (!TunInterfaceUp())
+            // Re-check path after traffic (still TUN)
+            var (pathOk2, pathDetail2) = VerifyTrafficUsesTun(new[] { "1.1.1.1" });
+            if (!pathOk2 || !TunInterfaceUp())
             {
-                return (false, "TUN Error: interface disappeared after verification");
+                _pathVerified = false;
+                return (false, $"Route Path Error after HTTPS: {pathDetail2}");
             }
 
             _log.Info($"Exit IP verified: {exitIp}");
@@ -153,6 +198,7 @@ public sealed class ConnectionService
         }
         catch (Exception ex)
         {
+            _pathVerified = false;
             var msg = ex.Message;
             if (msg.Contains("tun", StringComparison.OrdinalIgnoreCase))
                 msg = "TUN Error: " + msg;
@@ -221,17 +267,25 @@ public sealed class ConnectionService
         }
         if (successes >= 2 && !IsExactExpectedExit(ip))
         {
-            return (false, ip, $"Exit IP incomplete/mismatch after HTTPS success");
+            return (false, ip, "Exit IP incomplete/mismatch after HTTPS success");
         }
         return (false, ip, lastErr);
     }
 
     public async Task<(bool ok, string? exitIp, string detail)> VerifyHealthAsync(CancellationToken ct)
     {
-        if (_tunProcess?.IsRunning != true || !TunInterfaceUp())
+        if (_tunProcess?.IsRunning != true || !TunInterfaceUp() || !_pathVerified)
         {
-            return (false, null, "TUN not active");
+            return (false, null, "TUN/path not active");
         }
+
+        var (pathOk, pathDetail) = VerifyTrafficUsesTun(new[] { "1.1.1.1" });
+        if (!pathOk)
+        {
+            _pathVerified = false;
+            return (false, null, pathDetail);
+        }
+
         return await VerifyInternetAsync(ct);
     }
 
@@ -239,9 +293,10 @@ public sealed class ConnectionService
         !string.IsNullOrWhiteSpace(ip) &&
         string.Equals(ip.Trim(), _cred.server_ip.Trim(), StringComparison.Ordinal);
 
-    private async Task CleanupTunnelAsync()
+    private async Task<(bool ok, string message)> CleanupTunnelAsync(bool verifyInternetRestored)
     {
         _verifiedConnected = false;
+        _pathVerified = false;
         if (_tunProcess != null)
         {
             await _tunProcess.StopAsync();
@@ -249,12 +304,17 @@ public sealed class ConnectionService
             _tunProcess = null;
         }
 
-        await KillOwnedSingBoxAsync();
+        var (killed, killDetail) = await KillOwnedSingBoxAsync();
+        if (!killed && killDetail.Contains("refused", StringComparison.OrdinalIgnoreCase))
+        {
+            return (false, killDetail);
+        }
 
         TryDelete(Path.Combine(AppPaths.StateDir, "active-method.txt"));
+        TryDelete(OwnershipPath());
         TryDelete(Path.Combine(AppPaths.StateDir, "tun-pid.txt"));
+        _ownership = null;
 
-        // App-owned work configs
         try
         {
             foreach (var f in Directory.EnumerateFiles(AppPaths.WorkDir, "tun-*.json"))
@@ -264,18 +324,32 @@ public sealed class ConnectionService
         }
         catch { /* ignore */ }
 
-        // Confirm TUN interface is gone (best-effort; do not touch other VPNs)
-        for (var i = 0; i < 8 && TunInterfaceUp(); i++)
+        for (var i = 0; i < 10 && TunInterfaceUp(); i++)
         {
-            await Task.Delay(200);
+            await Task.Delay(250);
         }
+
         if (TunInterfaceUp())
         {
-            _log.Warn("TUN interface still present after cleanup wait");
+            return (false, "Cleanup Error: DirectVpnLab TUN interface still present");
         }
-        else
+
+        var (pathClear, pathMsg) = VerifyTrafficUsesTun(new[] { "1.1.1.1", "8.8.8.8" });
+        if (pathClear)
         {
-            _log.Info("TUN interface cleanup confirmed (DirectVpnLab absent or down)");
+            // Still routing via our TUN after stop => failure
+            return (false, "Cleanup Error: effective route still uses DirectVpnLab");
+        }
+        _log.Info($"Post-cleanup route check: {pathMsg}");
+
+        if (verifyInternetRestored)
+        {
+            var restored = await ProbeDirectInternetAsync();
+            if (!restored.ok)
+            {
+                return (false, $"Cleanup Error: normal internet path not restored ({restored.detail})");
+            }
+            _log.Info("Normal internet path probe succeeded after disconnect");
         }
 
         if (_netBeforePath != null)
@@ -283,43 +357,201 @@ public sealed class ConnectionService
             TryDelete(_netBeforePath);
             _netBeforePath = null;
         }
+
+        return (true, "cleanup verified");
     }
 
-    private void WritePidFile(int? pid)
+    private async Task<(bool ok, string detail)> ProbeDirectInternetAsync()
     {
         try
         {
-            var path = Path.Combine(AppPaths.StateDir, "tun-pid.txt");
-            if (pid is > 0)
+            var handler = new HttpClientHandler { UseProxy = false, Proxy = null };
+            using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(8) };
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+            using var resp = await client.GetAsync("https://1.1.1.1/cdn-cgi/trace", cts.Token);
+            if (!resp.IsSuccessStatusCode)
             {
-                File.WriteAllText(path, pid.Value.ToString());
+                return (false, $"HTTP {(int)resp.StatusCode}");
+            }
+            return (true, "ok");
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
+    private void WriteOwnershipFile(ProcessOwnership own)
+    {
+        var json = JsonSerializer.Serialize(own, new JsonSerializerOptions { WriteIndented = true });
+        File.WriteAllText(OwnershipPath(), json);
+        // legacy pid file for older recover paths
+        File.WriteAllText(Path.Combine(AppPaths.StateDir, "tun-pid.txt"), own.Pid.ToString());
+    }
+
+    private static string OwnershipPath() => Path.Combine(AppPaths.StateDir, "tun-ownership.json");
+
+    private async Task<(bool killedOrAbsent, string detail)> KillOwnedSingBoxAsync()
+    {
+        ProcessOwnership? own = _ownership;
+        try
+        {
+            var path = OwnershipPath();
+            if (own == null && File.Exists(path))
+            {
+                own = JsonSerializer.Deserialize<ProcessOwnership>(File.ReadAllText(path));
             }
         }
-        catch { /* ignore */ }
-    }
+        catch (Exception ex)
+        {
+            return (false, $"ownership parse failed: {ex.Message}");
+        }
 
-    private async Task KillOwnedSingBoxAsync()
-    {
-        var pidFile = Path.Combine(AppPaths.StateDir, "tun-pid.txt");
+        // migrate legacy pid-only file: refuse kill without path/start evidence
+        var legacyPid = Path.Combine(AppPaths.StateDir, "tun-pid.txt");
+        if (own == null && File.Exists(legacyPid))
+        {
+            TryDelete(legacyPid);
+            return (true, "legacy pid-only marker discarded without kill (insufficient ownership proof)");
+        }
+
+        if (own == null || own.Pid <= 0)
+        {
+            return (true, "no owned process recorded");
+        }
+
         try
         {
-            if (File.Exists(pidFile) &&
-                int.TryParse(File.ReadAllText(pidFile).Trim(), out var pid) &&
-                pid > 0)
+            Process p;
+            try
             {
-                try
+                p = Process.GetProcessById(own.Pid);
+            }
+            catch (ArgumentException)
+            {
+                return (true, "owned pid already absent");
+            }
+
+            using (p)
+            {
+                if (!p.ProcessName.Contains("sing-box", StringComparison.OrdinalIgnoreCase))
                 {
-                    var p = Process.GetProcessById(pid);
-                    if (p.ProcessName.Contains("sing-box", StringComparison.OrdinalIgnoreCase))
+                    return (false, $"refused kill: pid {own.Pid} name is '{p.ProcessName}', not sing-box");
+                }
+
+                string? livePath = null;
+                try { livePath = p.MainModule?.FileName; } catch { /* access denied */ }
+                var expected = Path.GetFullPath(own.ExePath);
+                var bundled = Path.GetFullPath(AppPaths.SingBoxExe);
+                if (!string.IsNullOrWhiteSpace(livePath))
+                {
+                    var liveFull = Path.GetFullPath(livePath);
+                    if (!PathsEqual(liveFull, expected) && !PathsEqual(liveFull, bundled))
                     {
-                        _log.Warn($"Stopping leftover owned sing-box pid={pid}");
-                        p.Kill(entireProcessTree: true);
-                        await p.WaitForExitAsync();
+                        return (false, $"refused kill: exe path mismatch live='{liveFull}' expected='{expected}'");
                     }
                 }
-                catch (ArgumentException)
+                else
                 {
-                    // process already gone
+                    // Without readable module path, require start-time window match only is weaker — refuse
+                    return (false, "refused kill: cannot read process executable path for ownership proof");
+                }
+
+                DateTime startUtc;
+                try { startUtc = p.StartTime.ToUniversalTime(); }
+                catch
+                {
+                    return (false, "refused kill: cannot read process start time");
+                }
+
+                var delta = (startUtc - own.StartedAtUtc).Duration();
+                if (delta > TimeSpan.FromSeconds(15))
+                {
+                    return (false, $"refused kill: start time delta {delta.TotalSeconds:F0}s exceeds ownership window");
+                }
+
+                _log.Warn($"Stopping verified owned sing-box pid={own.Pid}");
+                p.Kill(entireProcessTree: true);
+                await p.WaitForExitAsync();
+                TryDelete(OwnershipPath());
+                TryDelete(legacyPid);
+                return (true, "owned process stopped");
+            }
+        }
+        catch (Exception ex)
+        {
+            return (false, $"kill failed: {ex.Message}");
+        }
+    }
+
+    private static bool PathsEqual(string a, string b) =>
+        string.Equals(Path.GetFullPath(a).TrimEnd('\\'), Path.GetFullPath(b).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+
+    private (bool usesTun, string detail) VerifyTrafficUsesTun(IEnumerable<string> destinations)
+    {
+        var tunIndex = GetTunInterfaceIndex();
+        if (tunIndex is null)
+        {
+            return (false, "DirectVpnLab interface index not found");
+        }
+
+        var hits = new List<string>();
+        var misses = new List<string>();
+        foreach (var dest in destinations)
+        {
+            if (!IPAddress.TryParse(dest, out var ip) || ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+            {
+                misses.Add($"{dest}: invalid IPv4");
+                continue;
+            }
+
+            var addr = BitConverter.ToUInt32(ip.GetAddressBytes(), 0);
+            var rc = GetBestInterface(addr, out var bestIf);
+            if (rc != 0)
+            {
+                misses.Add($"{dest}: GetBestInterface rc={rc}");
+                continue;
+            }
+
+            if (bestIf == tunIndex.Value)
+            {
+                hits.Add($"{dest}->if{bestIf}");
+            }
+            else
+            {
+                var alias = FindInterfaceAliasByIndex((int)bestIf) ?? $"if{bestIf}";
+                misses.Add($"{dest}->{alias}");
+            }
+        }
+
+        if (hits.Count > 0 && misses.Count == 0)
+        {
+            return (true, string.Join(", ", hits));
+        }
+
+        return (false, misses.Count > 0
+            ? string.Join("; ", misses)
+            : "no route evidence");
+    }
+
+    private static int? GetTunInterfaceIndex()
+    {
+        try
+        {
+            foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (!ni.Name.Contains(TunInterfaceName, StringComparison.OrdinalIgnoreCase) &&
+                    !ni.Description.Contains(TunInterfaceName, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                try
+                {
+                    return ni.GetIPProperties().GetIPv4Properties()?.Index;
+                }
+                catch
+                {
+                    // ignore
                 }
             }
         }
@@ -327,10 +559,27 @@ public sealed class ConnectionService
         {
             // ignore
         }
-        finally
+        return null;
+    }
+
+    private static string? FindInterfaceAliasByIndex(int index)
+    {
+        try
         {
-            TryDelete(pidFile);
+            foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                try
+                {
+                    if (ni.GetIPProperties().GetIPv4Properties()?.Index == index)
+                    {
+                        return ni.Name;
+                    }
+                }
+                catch { /* ignore */ }
+            }
         }
+        catch { /* ignore */ }
+        return null;
     }
 
     private static bool TunInterfaceUp()
@@ -383,27 +632,77 @@ public sealed class ConnectionService
 
     private static string CaptureNetSnapshotJson()
     {
+        var ifaces = new List<object>();
+        var dns = new List<object>();
         try
         {
-            var ifaces = NetworkInterface.GetAllNetworkInterfaces()
-                .Select(n => new
+            foreach (var n in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                var props = n.GetIPProperties();
+                int? idx = null;
+                try { idx = props.GetIPv4Properties()?.Index; } catch { /* ignore */ }
+                ifaces.Add(new
                 {
                     n.Name,
                     n.Description,
                     Status = n.OperationalStatus.ToString(),
                     Type = n.NetworkInterfaceType.ToString(),
+                    Index = idx,
                     Id = n.Id
-                })
-                .ToArray();
-            return JsonSerializer.Serialize(new
-            {
-                capturedAt = DateTime.UtcNow,
-                interfaces = ifaces
-            }, new JsonSerializerOptions { WriteIndented = true });
+                });
+                dns.Add(new
+                {
+                    n.Name,
+                    Index = idx,
+                    DnsServers = props.DnsAddresses.Select(a => a.ToString()).ToArray(),
+                    Dhcp = props.GetIPv4Properties()?.IsDhcpEnabled
+                });
+            }
         }
         catch (Exception ex)
         {
             return JsonSerializer.Serialize(new { capturedAt = DateTime.UtcNow, error = ex.Message });
+        }
+
+        var routes = CaptureRoutesViaNetsh();
+        return JsonSerializer.Serialize(new
+        {
+            capturedAt = DateTime.UtcNow,
+            interfaces = ifaces,
+            dns,
+            routes
+        }, new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    private static object CaptureRoutesViaNetsh()
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "netsh",
+                Arguments = "interface ipv4 show route",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                StandardOutputEncoding = Encoding.UTF8
+            };
+            using var p = Process.Start(psi);
+            if (p == null) return new { error = "netsh failed to start" };
+            var output = p.StandardOutput.ReadToEnd();
+            p.WaitForExit(8000);
+            // Store text snapshot (not parsed aggressively) for before/after comparison evidence
+            var lines = output.Split('\n')
+                .Select(l => l.TrimEnd())
+                .Where(l => !string.IsNullOrWhiteSpace(l))
+                .Take(400)
+                .ToArray();
+            return new { source = "netsh interface ipv4 show route", lines };
+        }
+        catch (Exception ex)
+        {
+            return new { error = ex.Message };
         }
     }
 
@@ -428,5 +727,16 @@ public sealed class ConnectionService
         {
             return false;
         }
+    }
+
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    private static extern int GetBestInterface(uint dwDestAddr, out uint pdwBestIfIndex);
+
+    private sealed class ProcessOwnership
+    {
+        public int Pid { get; set; }
+        public string ExePath { get; set; } = "";
+        public DateTime StartedAtUtc { get; set; }
+        public string ConfigPath { get; set; } = "";
     }
 }
