@@ -163,7 +163,13 @@ public sealed class ConnectionService
                d.Contains("permission") ||
                d.Contains("wintun") ||
                d.Contains("tun driver") ||
-               d.Contains("elevation");
+               d.Contains("elevation") ||
+               d.Contains("legacy inbound") ||
+               d.Contains("removed in sing-box") ||
+               d.Contains("initialize inbound") ||
+               d.Contains("tun config invalid") ||
+               d.Contains("shared tun") ||
+               (d.Contains("sing-box check") && d.Contains("inbound"));
     }
 
     public async Task<(bool ok, string message)> DisconnectAsync()
@@ -193,11 +199,24 @@ public sealed class ConnectionService
                 return (false, "Windows Permission Error - run as Administrator for TUN");
             }
 
+            // Build + validate BEFORE any Windows route/DNS mutation (sing-box start)
+            var cfg = ConfigFactory.BuildTunConfig(_cred, m, AppPaths.WorkDir);
+            var (checkOk, checkDetail) = await ValidateTunConfigAsync(cfg, ct);
+            if (!checkOk)
+            {
+                _log.Fail($"TUN config check failed for {m.Id}: {checkDetail}");
+                if (IsSharedTunConfigFailure(checkDetail))
+                {
+                    return (false, $"TUN Config Invalid (shared/fatal): {TrimErr(checkDetail)}");
+                }
+                return (false, $"TUN Config Invalid: {TrimErr(checkDetail)}");
+            }
+            _log.Info($"TUN config validated (sing-box check) for {m.Id}");
+
             _netBeforePath = Path.Combine(AppPaths.StateDir, "net-before.json");
             File.WriteAllText(_netBeforePath, CaptureNetSnapshotJson());
             _log.Info("Captured baseline interfaces + routes + DNS");
 
-            var cfg = ConfigFactory.BuildTunConfig(_cred, m, AppPaths.WorkDir);
             _tunProcess = new SingBoxProcess(_log);
             await _tunProcess.StartAsync(cfg, ct);
             _ownership = new ProcessOwnership
@@ -262,13 +281,64 @@ public sealed class ConnectionService
         {
             _pathVerified = false;
             var msg = ex.Message;
-            if (msg.Contains("tun", StringComparison.OrdinalIgnoreCase))
+            if (IsSharedTunConfigFailure(msg) || IsFatalMessage(msg))
+                msg = "TUN Config Invalid (shared/fatal): " + TrimErr(msg);
+            else if (msg.Contains("tun", StringComparison.OrdinalIgnoreCase))
                 msg = "TUN Error: " + msg;
             else if (msg.Contains("route", StringComparison.OrdinalIgnoreCase))
                 msg = "Route Error: " + msg;
             return (false, msg);
         }
     }
+
+    private async Task<(bool ok, string detail)> ValidateTunConfigAsync(string cfgPath, CancellationToken ct)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = AppPaths.SingBoxExe,
+                Arguments = $"check -c \"{cfgPath}\"",
+                UseShellExecute = false,
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true,
+                WorkingDirectory = Path.GetDirectoryName(AppPaths.SingBoxExe) ?? AppPaths.BaseDir
+            };
+            using var p = Process.Start(psi) ?? throw new InvalidOperationException("sing-box check failed to start");
+            var errTask = p.StandardError.ReadToEndAsync(ct);
+            var outTask = p.StandardOutput.ReadToEndAsync(ct);
+            await p.WaitForExitAsync(ct);
+            var err = (await errTask).Trim();
+            _ = await outTask;
+            if (p.ExitCode != 0)
+            {
+                return (false, string.IsNullOrWhiteSpace(err) ? $"sing-box check exit={p.ExitCode}" : err);
+            }
+            return (true, "ok");
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
+    public static bool IsSharedTunConfigFailure(string detail)
+    {
+        var d = (detail ?? "").ToLowerInvariant();
+        return d.Contains("legacy inbound") ||
+               d.Contains("removed in sing-box") ||
+               d.Contains("initialize inbound") ||
+               d.Contains("migrate-legacy-inbound") ||
+               (d.Contains("inbound") && (d.Contains("deprecated") || d.Contains("unknown field") || d.Contains("decode")));
+    }
+
+    private static string TrimErr(string s) =>
+        string.IsNullOrWhiteSpace(s) ? "" : (s.Length <= 220 ? s.Trim() : s.Trim()[..220]);
 
     private async Task<(bool ok, string? exitIp, string detail)> VerifyInternetAsync(CancellationToken ct)
     {

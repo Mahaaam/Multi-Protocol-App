@@ -106,6 +106,7 @@ public static class ConfigFactory
             finalTag = "proxy";
         }
 
+        // sing-box 1.14.x: legacy inbound sniff/domain_strategy removed — use route rule actions
         var root = new JsonObject
         {
             ["log"] = new JsonObject
@@ -125,8 +126,7 @@ public static class ConfigFactory
                     ["mtu"] = 1400,
                     ["auto_route"] = true,
                     ["strict_route"] = true,
-                    ["stack"] = "mixed",
-                    ["sniff"] = true
+                    ["stack"] = "mixed"
                 }
             },
             ["outbounds"] = outbounds,
@@ -134,7 +134,12 @@ public static class ConfigFactory
             {
                 ["auto_detect_interface"] = true,
                 ["final"] = finalTag,
-                ["default_domain_resolver"] = "local"
+                ["default_domain_resolver"] = "local",
+                ["rules"] = new JsonArray
+                {
+                    new JsonObject { ["action"] = "sniff" },
+                    new JsonObject { ["protocol"] = "dns", ["action"] = "hijack-dns" }
+                }
             },
             ["dns"] = new JsonObject
             {
