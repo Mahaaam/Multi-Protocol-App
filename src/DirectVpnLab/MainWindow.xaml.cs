@@ -540,6 +540,55 @@ public partial class MainWindow : Window
         }
     }
 
+    private async void DiagC01_Click(object sender, RoutedEventArgs e)
+    {
+        if (_connection.IsTunnelRunning || _uiState is ConnectionUiState.Connected or ConnectionUiState.Degraded)
+        {
+            _log.Warn("DIAG C01 refused — disconnect VPN first");
+            return;
+        }
+
+        if (!TryBeginOp()) return;
+        BeginOpTracking();
+        _cts?.Cancel();
+        _cts = new CancellationTokenSource();
+        var ct = _cts.Token;
+        _userRequestedDisconnect = false;
+        SetBusy(true);
+        SetUiState(ConnectionUiState.Testing, "DIAG C01 proxy vs TUN");
+        try
+        {
+            var c01 = _methods.FirstOrDefault(m => m.Id == "C01")
+                      ?? ProtocolCatalog.BuildMethods(_cred).First(m => m.Id == "C01");
+            var diag = new ProxyTunCompareDiagnostic(_log, _cred, _connection);
+            var report = await diag.RunAsync(c01, ct);
+            TxtSpeedVpn.Text =
+                $"DIAG: P={report.Proxy.Outcome}/{report.Proxy.BytesReceived}B  T={report.Tun.Outcome}/{report.Tun.BytesReceived}B";
+            SetUiState(
+                report.CleanupOk ? ConnectionUiState.Disconnected : ConnectionUiState.Failed,
+                report.CleanupOk ? report.Summary : report.CleanupDetail);
+            _log.Info($"DIAG hypothesis: {report.Hypothesis}");
+        }
+        catch (OperationCanceledException)
+        {
+            _log.Warn("DIAG C01 cancelled — forcing cleanup");
+            try { await _connection.DisconnectAsync(); } catch { /* ignore */ }
+            SetUiState(ConnectionUiState.Disconnected);
+        }
+        catch (Exception ex)
+        {
+            _log.Error($"DIAG C01 error: {ex.Message}");
+            try { await _connection.DisconnectAsync(); } catch { /* ignore */ }
+            SetUiState(ConnectionUiState.Failed, ex.Message);
+        }
+        finally
+        {
+            SetBusy(false);
+            EndOp();
+            EndOpTracking();
+        }
+    }
+
     private static string FormatSpeed(string label, SpeedTestResult r)
     {
         if (!r.Success)
@@ -1048,6 +1097,8 @@ public partial class MainWindow : Window
         var op = busy || cancellable || _uiState == ConnectionUiState.Degraded;
         BtnTestAll.IsEnabled = (!op && !vpnActive) || cancellable;
         BtnSpeed.IsEnabled = !busy && !cancellable;
+        BtnDiagC01.IsEnabled = !busy && !cancellable && !vpnActive &&
+                               _uiState is ConnectionUiState.Disconnected or ConnectionUiState.Failed;
         BtnConnectTop.IsEnabled = (!busy || _uiState == ConnectionUiState.Connected) || cancellable;
         BtnConnect.IsEnabled = BtnConnectTop.IsEnabled;
         BtnDisconnect.IsEnabled = cancellable ||
@@ -1081,6 +1132,7 @@ public partial class MainWindow : Window
             or ConnectionUiState.Verifying or ConnectionUiState.Switching;
         BtnTestAll.IsEnabled = (!vpnActive && state is not (ConnectionUiState.Connecting or ConnectionUiState.Verifying
             or ConnectionUiState.Switching or ConnectionUiState.Degraded)) || state == ConnectionUiState.Testing;
+        BtnDiagC01.IsEnabled = state is ConnectionUiState.Disconnected or ConnectionUiState.Failed;
         BtnDisconnect.IsEnabled = cancellable || state is ConnectionUiState.Connected or ConnectionUiState.Degraded;
         BtnDisconnect.Content = cancellable ? "CANCEL" : "DISCONNECT";
         BtnConnectTop.Content = "CONNECT";

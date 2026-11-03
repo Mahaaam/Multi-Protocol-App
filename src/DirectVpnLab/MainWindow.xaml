@@ -122,7 +122,7 @@
             <Run Text="  ·  "/>
             <Run Text="82.23.248.121"/>
             <Run Text="  ·  "/>
-            <Run Text="v1.1.6"/>
+            <Run Text="v1.1.7"/>
           </TextBlock>
           <TextBlock x:Name="TxtPersistMeta" Margin="0,4,0,0" Foreground="{StaticResource Muted}" FontSize="11"
                      Text="Results: none saved yet"/>
@@ -132,6 +132,8 @@
           <Button Style="{StaticResource ActionBtn}" Content="CONNECT" Click="Connect_Click" x:Name="BtnConnectTop"/>
           <Button Style="{StaticResource ActionBtn}" Content="DISCONNECT" Click="Disconnect_Click" x:Name="BtnDisconnect" IsEnabled="False"/>
           <Button Style="{StaticResource ActionBtn}" Content="SPEED TEST" Click="SpeedTest_Click" x:Name="BtnSpeed"/>
+          <Button Style="{StaticResource ActionBtn}" Content="DIAG C01" Click="DiagC01_Click" x:Name="BtnDiagC01"
+                  ToolTip="A/B: C01 proxy-only vs full TUN — same 256KiB URL"/>
         </StackPanel>
       </Grid>
     </Border>
