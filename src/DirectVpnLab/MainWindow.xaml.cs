@@ -24,9 +24,13 @@ public partial class MainWindow : Window
     private SpeedTestResult? _directSpeed;
     private SpeedTestResult? _vpnSpeed;
     private bool _closingCleanupDone;
+    private bool _shutdownRequested;
     private int _healthGate;
     private int _opGate;
     private PersistedLabState _state;
+    private PersistedLabState _lastCompleteState;
+    private PersistedLabState? _testAllBaseline;
+    private TaskCompletionSource? _activeOpCompletion;
     private DateTime? _connectedSince;
 
     public MainWindow()
@@ -54,6 +58,7 @@ public partial class MainWindow : Window
         _persist = new PersistenceService(_log);
         _state = _persist.LoadOrCreate(_cred);
         _persist.ApplyToMethods(_state, _methods);
+        _lastCompleteState = CloneState(_state);
         if (_state.Ui.AutoScrollLog == false)
         {
             ChkAutoScroll.IsChecked = false;
@@ -108,14 +113,27 @@ public partial class MainWindow : Window
         if (_closingCleanupDone) return;
 
         e.Cancel = true;
+        _shutdownRequested = true;
         _healthTimer.Stop();
         _durationTimer.Stop();
         SetBusy(true);
         try
         {
+            // Cancel any in-flight TEST ALL / CONNECT and wait for real completion + cleanup
             _cts?.Cancel();
-            _state.Ui.AutoScrollLog = ChkAutoScroll.IsChecked == true;
-            SaveResultsSnapshot();
+            await WaitForActiveOpAsync(TimeSpan.FromSeconds(45));
+
+            // If discovery was interrupted, never persist partial method rows
+            if (_testAllBaseline != null)
+            {
+                AbortDiscoveryToBaseline("Shutdown during TEST ALL — restoring last complete results (partial discarded)");
+            }
+            else if (_uiState == ConnectionUiState.Testing)
+            {
+                RestoreLastCompleteToUi("Shutdown during TEST ALL — reloading last complete results");
+            }
+
+            PersistUiPrefsPreservingCompleteResults();
             var (ok, msg) = await _connection.DisconnectAsync();
             if (!ok) _log.Fail($"Shutdown cleanup incomplete: {msg}");
             else _log.Info("Shutdown cleanup finished");
@@ -124,6 +142,19 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
+            try
+            {
+                if (_testAllBaseline != null)
+                {
+                    AbortDiscoveryToBaseline("Shutdown error path — restoring last complete results");
+                }
+                PersistUiPrefsPreservingCompleteResults();
+                await _connection.DisconnectAsync();
+            }
+            catch
+            {
+                // best-effort cleanup
+            }
             _closingCleanupDone = true;
             _log.Error($"Shutdown cleanup error: {ex.Message}");
             Close();
@@ -147,6 +178,7 @@ public partial class MainWindow : Window
         }
 
         if (!TryBeginOp()) return;
+        BeginOpTracking();
 
         // Re-evaluate network freshness before Quick Connect (Wi-Fi/Hotspot/server/engine)
         _state = _persist.LoadOrCreate(_cred);
@@ -166,6 +198,7 @@ public partial class MainWindow : Window
             _log.Fail(fatal);
             SetUiState(ConnectionUiState.Failed, fatal);
             EndOp();
+            EndOpTracking();
             return;
         }
 
@@ -234,6 +267,7 @@ public partial class MainWindow : Window
                         _persist.UpsertMethod(_state, other);
                     }
                     _persist.Save(_state, _cred);
+                    _lastCompleteState = CloneState(_state);
                     UpdatePersistMeta();
                     _healthTimer.Start();
                     _log.Info($"Quick Connect finished in {sw.Elapsed.TotalSeconds:F1}s via {m.Id}");
@@ -276,6 +310,7 @@ public partial class MainWindow : Window
         {
             SetBusy(false);
             EndOp();
+            EndOpTracking();
         }
     }
 
@@ -309,14 +344,15 @@ public partial class MainWindow : Window
         }
 
         if (!TryBeginOp()) return;
+        BeginOpTracking();
 
         _cts?.Cancel();
         _cts = new CancellationTokenSource();
         SetBusy(true);
         SetUiState(ConnectionUiState.Testing);
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        // Snapshot for cancel rollback — incomplete run must not replace a complete saved test
-        var rollback = _persist.CaptureFromMethods(
+        // Snapshot for cancel/error/shutdown rollback — must not replace last complete DPAPI results
+        _testAllBaseline = _persist.CaptureFromMethods(
             _methods,
             _cred,
             _state.LastTestAtUtc,
@@ -324,6 +360,7 @@ public partial class MainWindow : Window
             resultsStale: _state.ResultsStale,
             staleReason: _state.StaleReason,
             lastTestIncomplete: _state.LastTestIncomplete);
+        _testAllBaseline.Ui = CloneUi(_state.Ui);
         try
         {
             var discovery = new DiscoveryService(_log, _cred);
@@ -338,7 +375,11 @@ public partial class MainWindow : Window
                 resultsStale: false,
                 staleReason: null,
                 lastTestIncomplete: false);
+            _state.Ui = CloneUi(_lastCompleteState.Ui);
+            _state.Ui.AutoScrollLog = ChkAutoScroll.IsChecked == true;
             _persist.Save(_state, _cred);
+            _lastCompleteState = CloneState(_state);
+            _testAllBaseline = null;
             UpdatePersistMeta();
             sw.Stop();
             SetUiState(ConnectionUiState.Disconnected);
@@ -346,25 +387,35 @@ public partial class MainWindow : Window
         }
         catch (OperationCanceledException)
         {
-            _log.Warn("TEST ALL cancelled — restoring last complete results (partial run discarded)");
-            _persist.ApplyToMethods(rollback, _methods);
-            DiscoveryService.Rank(_methods.ToList());
-            _state = rollback;
-            _state.LastTestIncomplete = true;
-            // Do not overwrite DPAPI complete snapshot with incomplete ranking
-            RefreshGrids();
-            UpdatePersistMeta();
-            SetUiState(ConnectionUiState.Disconnected);
+            AbortDiscoveryToBaseline(
+                _shutdownRequested
+                    ? "TEST ALL cancelled by shutdown — last complete results restored (not saved as new test)"
+                    : "TEST ALL cancelled — restoring last complete results (partial run discarded)");
+            if (!_shutdownRequested)
+            {
+                SetUiState(ConnectionUiState.Disconnected);
+            }
         }
         catch (Exception ex)
         {
-            _log.Error(ex.Message);
-            SetUiState(ConnectionUiState.Failed, ex.Message);
+            _log.Error($"TEST ALL failed unexpectedly: {ex.Message}");
+            AbortDiscoveryToBaseline(
+                "TEST ALL aborted after unexpected error — restoring last complete results (partial discarded)");
+            if (!_shutdownRequested)
+            {
+                SetUiState(ConnectionUiState.Failed, ex.Message);
+            }
         }
         finally
         {
+            if (_testAllBaseline != null && !_shutdownRequested)
+            {
+                // Safety net if an unexpected path left baseline set
+                AbortDiscoveryToBaseline("TEST ALL ended incompletely — restoring last complete results");
+            }
             SetBusy(false);
             EndOp();
+            EndOpTracking();
         }
     }
 
@@ -578,6 +629,13 @@ public partial class MainWindow : Window
 
     private void SaveResultsSnapshot()
     {
+        // Only persist when UI methods reflect a complete/consistent session — never mid TEST ALL
+        if (_testAllBaseline != null || _uiState == ConnectionUiState.Testing)
+        {
+            _log.Warn("SaveResultsSnapshot skipped — TEST ALL in progress; refusing to overwrite complete results");
+            return;
+        }
+
         var ui = _state.Ui;
         ui.AutoScrollLog = ChkAutoScroll.IsChecked == true;
         _state = _persist.CaptureFromMethods(
@@ -587,11 +645,113 @@ public partial class MainWindow : Window
             _state.BestMethodId ?? _methods.Where(m => m.Status == TestStatus.Pass).OrderBy(m => m.Rank).FirstOrDefault()?.Id,
             resultsStale: _state.ResultsStale,
             staleReason: _state.StaleReason,
-            lastTestIncomplete: _state.LastTestIncomplete);
+            lastTestIncomplete: false);
         _state.Ui = ui;
         _persist.Save(_state, _cred);
+        _lastCompleteState = CloneState(_state);
         UpdatePersistMeta();
     }
+
+    private void PersistUiPrefsPreservingCompleteResults()
+    {
+        var complete = CloneState(_lastCompleteState);
+        complete.Ui.AutoScrollLog = ChkAutoScroll.IsChecked == true;
+        // Keep last complete method rows from disk baseline — do not capture in-progress grid
+        _persist.ApplyToMethods(complete, _methods);
+        DiscoveryService.Rank(_methods.ToList());
+        _state = complete;
+        _lastCompleteState = CloneState(complete);
+        _persist.Save(complete, _cred);
+        RefreshGrids();
+        UpdatePersistMeta();
+        _log.Info("UI prefs saved; last complete protocol results preserved");
+    }
+
+    private void AbortDiscoveryToBaseline(string reason)
+    {
+        var baseline = _testAllBaseline ?? _lastCompleteState;
+        _log.Warn(reason);
+        _persist.ApplyToMethods(baseline, _methods);
+        DiscoveryService.Rank(_methods.ToList());
+        _state = CloneState(baseline);
+        _state.LastTestIncomplete = true; // in-memory note only — disk keeps last complete Save
+        _testAllBaseline = null;
+        RefreshGrids();
+        UpdatePersistMeta();
+    }
+
+    private void RestoreLastCompleteToUi(string reason)
+    {
+        _log.Warn(reason);
+        _persist.ApplyToMethods(_lastCompleteState, _methods);
+        DiscoveryService.Rank(_methods.ToList());
+        _state = CloneState(_lastCompleteState);
+        _testAllBaseline = null;
+        RefreshGrids();
+        UpdatePersistMeta();
+    }
+
+    private void BeginOpTracking()
+    {
+        _activeOpCompletion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    private void EndOpTracking()
+    {
+        _activeOpCompletion?.TrySetResult();
+        _activeOpCompletion = null;
+    }
+
+    private async Task WaitForActiveOpAsync(TimeSpan timeout)
+    {
+        var tcs = _activeOpCompletion;
+        if (tcs == null) return;
+        var finished = await Task.WhenAny(tcs.Task, Task.Delay(timeout));
+        if (finished != tcs.Task)
+        {
+            _log.Warn($"Timed out waiting for active operation after {timeout.TotalSeconds:F0}s");
+        }
+    }
+
+    private static PersistedLabState CloneState(PersistedLabState src) => new()
+    {
+        SchemaVersion = src.SchemaVersion,
+        ServerIp = src.ServerIp,
+        EngineVersion = src.EngineVersion,
+        NetworkFingerprint = src.NetworkFingerprint,
+        LastTestAtUtc = src.LastTestAtUtc,
+        BestMethodId = src.BestMethodId,
+        LastExitIp = src.LastExitIp,
+        ResultsStale = src.ResultsStale,
+        StaleReason = src.StaleReason,
+        LastTestIncomplete = src.LastTestIncomplete,
+        Ui = CloneUi(src.Ui),
+        Methods = src.Methods.Select(m => new PersistedMethodResult
+        {
+            Id = m.Id,
+            Status = m.Status,
+            LatencyMs = m.LatencyMs,
+            JitterMs = m.JitterMs,
+            ConnectTimeMs = m.ConnectTimeMs,
+            SuccessRate = m.SuccessRate,
+            QualityScore = m.QualityScore,
+            Rank = m.Rank,
+            ExitIp = m.ExitIp,
+            LastError = m.LastError,
+            SkipReason = m.SkipReason,
+            TestedAtUtc = m.TestedAtUtc,
+            ProbeAttempts = m.ProbeAttempts,
+            ProbeSuccesses = m.ProbeSuccesses,
+            FailureKind = m.FailureKind,
+            IsHistorical = m.IsHistorical
+        }).ToList()
+    };
+
+    private static UiPrefs CloneUi(UiPrefs ui) => new()
+    {
+        AutoScrollLog = ui.AutoScrollLog,
+        LastSelectedMethodId = ui.LastSelectedMethodId
+    };
 
     private void UpdatePersistMeta()
     {

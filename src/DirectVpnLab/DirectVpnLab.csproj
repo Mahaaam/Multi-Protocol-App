@@ -10,8 +10,8 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>DirectVpnLab</AssemblyName>
     <Product>Direct VPN Lab</Product>
-    <Version>1.1.2</Version>
-    <InformationalVersion>1.1.2</InformationalVersion>
+    <Version>1.1.3</Version>
+    <InformationalVersion>1.1.3</InformationalVersion>
     <PlatformTarget>x64</PlatformTarget>
   </PropertyGroup>
 
