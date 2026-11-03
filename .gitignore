@@ -1,0 +1,28 @@
+# Direct VPN Lab
+node_modules/
+dist/
+bin/
+obj/
+publish/
+*.user
+.env
+.env.*
+!.env.example
+TMP/
+**/certificates/
+**/private/
+**/*.key
+**/credentials*
+**/Assets/certs/
+server/secrets/
+client/secrets/
+*.pem
+.DS_Store
+# Keep tracked app source; ignore local build outputs and bundled secrets/binaries
+src/DirectVpnLab/bin/
+src/DirectVpnLab/obj/
+src/DirectVpnLab/Assets/sing-box/
+publish/
+publish-standalone/
+*.exe
+!**/sing-box.exe

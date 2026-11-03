@@ -1,0 +1,44 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <ApplicationIcon />
+    <AssemblyName>DirectVpnLab</AssemblyName>
+    <Product>Direct VPN Lab</Product>
+    <Version>1.0.0</Version>
+    <InformationalVersion>1.0.0</InformationalVersion>
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="Assets\sing-box\sing-box.exe">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>Assets\sing-box\sing-box.exe</TargetPath>
+    </None>
+    <None Include="Assets\sing-box\wintun.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>Assets\sing-box\wintun.dll</TargetPath>
+    </None>
+    <None Include="Assets\certs\ca.crt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>Assets\certs\ca.crt</TargetPath>
+    </None>
+    <None Include="Assets\certs\credentials.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>Assets\certs\credentials.json</TargetPath>
+    </None>
+    <None Include="Assets\certs\client.crt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>Assets\certs\client.crt</TargetPath>
+    </None>
+    <None Include="Assets\certs\client.key">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>Assets\certs\client.key</TargetPath>
+    </None>
+  </ItemGroup>
+
+</Project>
