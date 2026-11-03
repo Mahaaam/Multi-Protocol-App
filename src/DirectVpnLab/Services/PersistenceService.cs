@@ -17,6 +17,7 @@ public sealed class PersistedLabState
     public string? LastExitIp { get; set; }
     public bool ResultsStale { get; set; }
     public string? StaleReason { get; set; }
+    public bool LastTestIncomplete { get; set; }
     public List<PersistedMethodResult> Methods { get; set; } = new();
     public UiPrefs Ui { get; set; } = new();
 }
@@ -37,6 +38,8 @@ public sealed class PersistedMethodResult
     public DateTime? TestedAtUtc { get; set; }
     public int ProbeAttempts { get; set; }
     public int ProbeSuccesses { get; set; }
+    public string? FailureKind { get; set; }
+    public bool IsHistorical { get; set; }
 }
 
 public sealed class UiPrefs
@@ -135,22 +138,22 @@ public sealed class PersistenceService
             m.Rank = p.Rank;
             m.ExitIp = p.ExitIp;
             m.LastError = p.LastError;
+            m.LastTestedAtUtc = p.TestedAtUtc;
+            m.ProbeAttempts = p.ProbeAttempts;
+            m.ProbeSuccesses = p.ProbeSuccesses;
+            if (Enum.TryParse<FailureKind>(p.FailureKind, true, out var fk))
+            {
+                m.FailureKind = fk;
+            }
+
+            // Restored SkipReason: keep permanent; keep dependency skip only as FailureKind hint
             if (!string.IsNullOrWhiteSpace(p.SkipReason))
             {
                 m.SkipReason = p.SkipReason;
             }
-            m.LastTestedAtUtc = p.TestedAtUtc;
-            m.ProbeAttempts = p.ProbeAttempts;
-            m.ProbeSuccesses = p.ProbeSuccesses;
-        }
 
-        if (state.ResultsStale)
-        {
-            foreach (var m in methods.Where(x => x.Status == TestStatus.Pass))
-            {
-                // Keep data visible but mark as historical — not live Connected
-                m.IsHistorical = true;
-            }
+            // Any restored non-pending result is Cached until live revalidation — never "live Connected"
+            m.IsHistorical = m.Status != TestStatus.Pending;
         }
     }
 
@@ -158,8 +161,12 @@ public sealed class PersistenceService
         IEnumerable<ProtocolMethod> methods,
         LabCredentials cred,
         DateTime? lastTestAtUtc,
-        string? bestMethodId)
+        string? bestMethodId,
+        bool resultsStale = false,
+        string? staleReason = null,
+        bool lastTestIncomplete = false)
     {
+        var list = methods.ToList();
         var state = new PersistedLabState
         {
             ServerIp = cred.server_ip,
@@ -167,10 +174,12 @@ public sealed class PersistenceService
             NetworkFingerprint = CaptureNetworkFingerprint(),
             LastTestAtUtc = lastTestAtUtc,
             BestMethodId = bestMethodId,
-            LastExitIp = methods.FirstOrDefault(m => m.Status == TestStatus.Pass)?.ExitIp,
-            ResultsStale = false,
-            StaleReason = null,
-            Methods = methods.Select(m => new PersistedMethodResult
+            LastExitIp = list.FirstOrDefault(m => m.Status == TestStatus.Pass && !m.IsHistorical)?.ExitIp
+                         ?? list.FirstOrDefault(m => m.Status == TestStatus.Pass)?.ExitIp,
+            ResultsStale = resultsStale,
+            StaleReason = staleReason,
+            LastTestIncomplete = lastTestIncomplete,
+            Methods = list.Select(m => new PersistedMethodResult
             {
                 Id = m.Id,
                 Status = m.Status.ToString(),
@@ -185,10 +194,47 @@ public sealed class PersistenceService
                 SkipReason = m.SkipReason,
                 TestedAtUtc = m.LastTestedAtUtc ?? lastTestAtUtc,
                 ProbeAttempts = m.ProbeAttempts,
-                ProbeSuccesses = m.ProbeSuccesses
+                ProbeSuccesses = m.ProbeSuccesses,
+                FailureKind = m.FailureKind.ToString(),
+                IsHistorical = m.IsHistorical
             }).ToList()
         };
         return state;
+    }
+
+    /// <summary>Update a single method inside an existing persisted state (Quick Recheck / connect).</summary>
+    public void UpsertMethod(PersistedLabState state, ProtocolMethod method)
+    {
+        var existing = state.Methods.FirstOrDefault(x =>
+            string.Equals(x.Id, method.Id, StringComparison.OrdinalIgnoreCase));
+        var row = new PersistedMethodResult
+        {
+            Id = method.Id,
+            Status = method.Status.ToString(),
+            LatencyMs = method.LatencyMs,
+            JitterMs = method.JitterMs,
+            ConnectTimeMs = method.ConnectTimeMs,
+            SuccessRate = method.SuccessRate,
+            QualityScore = method.QualityScore,
+            Rank = method.Rank,
+            ExitIp = method.ExitIp,
+            LastError = method.LastError,
+            SkipReason = method.SkipReason,
+            TestedAtUtc = method.LastTestedAtUtc,
+            ProbeAttempts = method.ProbeAttempts,
+            ProbeSuccesses = method.ProbeSuccesses,
+            FailureKind = method.FailureKind.ToString(),
+            IsHistorical = method.IsHistorical
+        };
+        if (existing == null)
+        {
+            state.Methods.Add(row);
+        }
+        else
+        {
+            var idx = state.Methods.IndexOf(existing);
+            state.Methods[idx] = row;
+        }
     }
 
     private static PersistedLabState Fresh(LabCredentials cred, string fp, string engine) => new()

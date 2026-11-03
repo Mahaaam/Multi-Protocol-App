@@ -203,12 +203,17 @@ public partial class MainWindow : Window
                 var (ok, detail) = await discovery.QuickRecheckAsync(m, ct);
                 if (!ok)
                 {
+                    // Keep prior Pass as cached — do not present as live success
+                    m.IsHistorical = true;
+                    m.LastError = detail;
                     lastFail = $"{m.Id}: {detail}";
-                    _log.Warn($"Quick recheck failed — trying next: {lastFail}");
+                    _log.Warn($"Quick recheck failed (cached Pass retained) — trying next: {lastFail}");
                     continue;
                 }
 
+                // Only this protocol leaves Cached state after live recheck
                 m.IsHistorical = false;
+                m.LastTestedAtUtc = DateTime.UtcNow;
                 _log.Info($"Recheck OK — starting TUN for {m.Id} ({detail})");
                 var (connOk, msg) = await _connection.ConnectBestAsync(new[] { m }, ct);
                 if (connOk && _connection.IsConnected)
@@ -217,13 +222,26 @@ public partial class MainWindow : Window
                     ApplyConnectedUi(_connection.ActiveMethod!, sw.Elapsed);
                     _state.BestMethodId = m.Id;
                     _state.LastExitIp = m.ExitIp;
-                    _state.ResultsStale = false;
-                    _state.StaleReason = null;
-                    SaveResultsSnapshot();
+                    // Environment OK for this session; other methods remain IsHistorical
+                    if (!_state.ResultsStale)
+                    {
+                        _state.StaleReason = null;
+                    }
+                    _state.LastTestIncomplete = false;
+                    _persist.UpsertMethod(_state, m);
+                    foreach (var other in _methods.Where(x => x.Id != m.Id))
+                    {
+                        _persist.UpsertMethod(_state, other);
+                    }
+                    _persist.Save(_state, _cred);
+                    UpdatePersistMeta();
                     _healthTimer.Start();
                     _log.Info($"Quick Connect finished in {sw.Elapsed.TotalSeconds:F1}s via {m.Id}");
                     return;
                 }
+
+                // TUN failed after recheck — revert this method to cached (not live-verified session)
+                m.IsHistorical = true;
 
                 lastFail = msg;
                 _log.Warn($"TUN failed for {m.Id}: {msg}");
@@ -297,13 +315,17 @@ public partial class MainWindow : Window
         SetBusy(true);
         SetUiState(ConnectionUiState.Testing);
         var sw = System.Diagnostics.Stopwatch.StartNew();
+        // Snapshot for cancel rollback — incomplete run must not replace a complete saved test
+        var rollback = _persist.CaptureFromMethods(
+            _methods,
+            _cred,
+            _state.LastTestAtUtc,
+            _state.BestMethodId,
+            resultsStale: _state.ResultsStale,
+            staleReason: _state.StaleReason,
+            lastTestIncomplete: _state.LastTestIncomplete);
         try
         {
-            foreach (var m in _methods)
-            {
-                m.IsHistorical = false;
-            }
-
             var discovery = new DiscoveryService(_log, _cred);
             await discovery.RunAsync(_methods.ToList(), new Progress<ProtocolMethod>(_ => RefreshGrids()), _cts.Token);
             RefreshGrids();
@@ -312,7 +334,10 @@ public partial class MainWindow : Window
                 _methods,
                 _cred,
                 DateTime.UtcNow,
-                _methods.Where(m => m.Status == TestStatus.Pass).OrderBy(m => m.Rank).FirstOrDefault()?.Id);
+                _methods.Where(m => m.Status == TestStatus.Pass).OrderBy(m => m.Rank).FirstOrDefault()?.Id,
+                resultsStale: false,
+                staleReason: null,
+                lastTestIncomplete: false);
             _persist.Save(_state, _cred);
             UpdatePersistMeta();
             sw.Stop();
@@ -321,9 +346,14 @@ public partial class MainWindow : Window
         }
         catch (OperationCanceledException)
         {
-            _log.Warn("TEST ALL cancelled — partial results kept where available");
+            _log.Warn("TEST ALL cancelled — restoring last complete results (partial run discarded)");
+            _persist.ApplyToMethods(rollback, _methods);
+            DiscoveryService.Rank(_methods.ToList());
+            _state = rollback;
+            _state.LastTestIncomplete = true;
+            // Do not overwrite DPAPI complete snapshot with incomplete ranking
             RefreshGrids();
-            SaveResultsSnapshot();
+            UpdatePersistMeta();
             SetUiState(ConnectionUiState.Disconnected);
         }
         catch (Exception ex)
@@ -548,28 +578,50 @@ public partial class MainWindow : Window
 
     private void SaveResultsSnapshot()
     {
+        var ui = _state.Ui;
+        ui.AutoScrollLog = ChkAutoScroll.IsChecked == true;
         _state = _persist.CaptureFromMethods(
             _methods,
             _cred,
             _state.LastTestAtUtc,
-            _state.BestMethodId ?? _methods.Where(m => m.Status == TestStatus.Pass).OrderBy(m => m.Rank).FirstOrDefault()?.Id);
-        _state.Ui.AutoScrollLog = ChkAutoScroll.IsChecked == true;
+            _state.BestMethodId ?? _methods.Where(m => m.Status == TestStatus.Pass).OrderBy(m => m.Rank).FirstOrDefault()?.Id,
+            resultsStale: _state.ResultsStale,
+            staleReason: _state.StaleReason,
+            lastTestIncomplete: _state.LastTestIncomplete);
+        _state.Ui = ui;
         _persist.Save(_state, _cred);
         UpdatePersistMeta();
     }
 
     private void UpdatePersistMeta()
     {
-        if (_state.LastTestAtUtc == null)
+        if (_state.LastTestAtUtc == null && _state.Methods.Count == 0)
         {
             TxtPersistMeta.Text = "Results: none saved yet";
             return;
         }
 
-        var local = _state.LastTestAtUtc.Value.ToLocalTime();
-        var stale = _state.ResultsStale ? $" · STALE: {_state.StaleReason}" : " · saved locally";
-        var best = string.IsNullOrWhiteSpace(_state.BestMethodId) ? "" : $" · best {_state.BestMethodId}";
-        TxtPersistMeta.Text = $"Last test: {local:yyyy-MM-dd HH:mm}{best}{stale}";
+        var local = _state.LastTestAtUtc?.ToLocalTime();
+        var cached = _methods.Count(m => m.IsHistorical);
+        var parts = new List<string>();
+        if (local != null)
+        {
+            parts.Add($"Last test: {local:yyyy-MM-dd HH:mm}");
+        }
+        if (!string.IsNullOrWhiteSpace(_state.BestMethodId))
+        {
+            parts.Add($"best {_state.BestMethodId}");
+        }
+        parts.Add(cached > 0 ? $"{cached} cached" : "live session marks only");
+        if (_state.ResultsStale)
+        {
+            parts.Add($"STALE: {_state.StaleReason}");
+        }
+        if (_state.LastTestIncomplete)
+        {
+            parts.Add("last TEST ALL cancelled");
+        }
+        TxtPersistMeta.Text = string.Join(" · ", parts);
     }
 
     private void ClearConnInfo()

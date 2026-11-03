@@ -32,14 +32,18 @@ public sealed class DiscoveryService
 
         EnsureNaiveDependency(methods);
 
-        // Instant classification for unsupported / missing deps (no network wait)
+        // Fresh TEST ALL: re-evaluate skips; do not keep prior Pass mixed into new ranking
+        var priorLatency = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
         var runnable = new List<ProtocolMethod>();
         foreach (var m in methods)
         {
             ct.ThrowIfCancellationRequested();
-            m.IsHistorical = false;
-            m.ProbeAttempts = 0;
-            m.ProbeSuccesses = 0;
+            if (m.LatencyMs > 0)
+            {
+                priorLatency[m.Id] = m.LatencyMs;
+            }
+
+            PrepareMethodForFreshTest(m);
 
             if (TryMarkNonRunnable(m))
             {
@@ -50,10 +54,9 @@ public sealed class DiscoveryService
             runnable.Add(m);
         }
 
-        // Prefer previously fast / PASS methods first so parallel slots fill useful work sooner
+        // Schedule order may use prior latency hints only — ranking uses this run's Pass only
         runnable = runnable
-            .OrderByDescending(m => m.Status == TestStatus.Pass)
-            .ThenBy(m => m.LatencyMs <= 0 ? 9_999 : m.LatencyMs)
+            .OrderBy(m => priorLatency.TryGetValue(m.Id, out var lat) ? lat : 9_999)
             .ThenBy(m => m.Id)
             .ToList();
 
@@ -151,46 +154,126 @@ public sealed class DiscoveryService
         }
     }
 
+    /// <summary>Reset transient skip/pass state so a new TEST ALL re-evaluates current conditions.</summary>
+    public static void PrepareMethodForFreshTest(ProtocolMethod m)
+    {
+        m.IsHistorical = false;
+        m.ProbeAttempts = 0;
+        m.ProbeSuccesses = 0;
+        m.Rank = 0;
+        m.QualityScore = 0;
+
+        if (IsTransientSkip(m))
+        {
+            m.SkipReason = null;
+            m.LastError = null;
+            m.FailureKind = FailureKind.None;
+        }
+
+        // Permanent unsupported keeps SkipReason; everything else starts Pending until classified
+        if (m.Id is "F01" or "F02")
+        {
+            return;
+        }
+
+        if (m.Port <= 0 &&
+            !string.IsNullOrEmpty(m.SkipReason) &&
+            m.SkipReason.StartsWith("Port key missing", StringComparison.OrdinalIgnoreCase))
+        {
+            m.FailureKind = FailureKind.Unsupported;
+            return;
+        }
+
+        m.Status = TestStatus.Pending;
+        if (!IsPermanentSkipReason(m.SkipReason))
+        {
+            m.SkipReason = null;
+        }
+    }
+
+    public static bool IsTransientSkip(ProtocolMethod m)
+    {
+        if (m.FailureKind == FailureKind.DependencyMissing)
+        {
+            return true;
+        }
+
+        var reason = m.SkipReason ?? m.LastError ?? "";
+        return reason.Contains("libcronet", StringComparison.OrdinalIgnoreCase) ||
+               reason.Contains("Dependency missing", StringComparison.OrdinalIgnoreCase) ||
+               reason.Contains("library not found", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsPermanentSkipReason(string? reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason)) return false;
+        return reason.StartsWith("Port key missing", StringComparison.OrdinalIgnoreCase) ||
+               reason.Contains("Unsupported", StringComparison.OrdinalIgnoreCase) ||
+               reason.Contains("MASQUE", StringComparison.OrdinalIgnoreCase);
+    }
+
     private bool TryMarkNonRunnable(ProtocolMethod m, bool reportLog = true)
     {
+        // 1) Permanent engine unsupported (MASQUE on 1.14.4)
         if (m.Id is "F01" or "F02")
         {
             m.Status = TestStatus.Skipped;
             m.FailureKind = FailureKind.Unsupported;
-            m.SkipReason ??= "Unsupported: MASQUE requires sing-box >= 1.15.0 (engine is 1.14.4)";
+            m.SkipReason = "Unsupported: MASQUE requires sing-box >= 1.15.0 (engine is 1.14.4)";
             m.LastError = m.SkipReason;
             m.LastTestedAtUtc = DateTime.UtcNow;
             if (reportLog) _log.Warn($"SKIPPED - {m.Id}: {m.SkipReason}");
             return true;
         }
 
-        if (m.IsSkipped)
+        // 2) Permanent structural catalog gap (missing port key)
+        if (m.Port <= 0 ||
+            (!string.IsNullOrEmpty(m.SkipReason) &&
+             m.SkipReason.StartsWith("Port key missing", StringComparison.OrdinalIgnoreCase)))
         {
             m.Status = TestStatus.Skipped;
             m.FailureKind = FailureKind.Unsupported;
-            m.LastError ??= m.SkipReason;
-            m.LastTestedAtUtc = DateTime.UtcNow;
-            if (reportLog) _log.Warn($"SKIPPED - {m.Id}: {m.SkipReason}");
-            return true;
-        }
-
-        if ((m.Id is "D01" or "D02") && !File.Exists(AppPaths.LibCronetDll))
-        {
-            m.Status = TestStatus.Skipped;
-            m.FailureKind = FailureKind.DependencyMissing;
-            m.SkipReason = "Dependency missing: libcronet.dll (NaiveProxy)";
+            m.SkipReason ??= "Port key missing";
             m.LastError = m.SkipReason;
             m.LastTestedAtUtc = DateTime.UtcNow;
             if (reportLog) _log.Warn($"SKIPPED - {m.Id}: {m.SkipReason}");
             return true;
         }
 
+        // 3) Transient dependency — re-check live filesystem (prior SkipReason must not stick)
+        if (m.Id is "D01" or "D02")
+        {
+            if (!File.Exists(AppPaths.LibCronetDll))
+            {
+                m.Status = TestStatus.Skipped;
+                m.FailureKind = FailureKind.DependencyMissing;
+                m.SkipReason = "Dependency missing: libcronet.dll (NaiveProxy)";
+                m.LastError = m.SkipReason;
+                m.LastTestedAtUtc = DateTime.UtcNow;
+                if (reportLog) _log.Warn($"SKIPPED - {m.Id}: {m.SkipReason}");
+                return true;
+            }
+
+            // Dependency restored — clear any prior dependency skip and allow test
+            if (IsTransientSkip(m) ||
+                (m.Status == TestStatus.Skipped &&
+                 (m.SkipReason?.Contains("libcronet", StringComparison.OrdinalIgnoreCase) == true)))
+            {
+                m.SkipReason = null;
+                m.LastError = null;
+                m.FailureKind = FailureKind.None;
+                m.Status = TestStatus.Pending;
+                if (reportLog) _log.Info($"{m.Id}: libcronet.dll present — re-enabled for testing");
+            }
+        }
+
+        // Do NOT treat leftover SkipReason from older runs as permanent Unsupported
         return false;
     }
 
     private void EnsureNaiveDependency(IReadOnlyList<ProtocolMethod> methods)
     {
-        var need = methods.Any(m => (m.Id is "D01" or "D02") && !m.IsSkipped);
+        var need = methods.Any(m => m.Id is "D01" or "D02");
         if (!need) return;
         if (File.Exists(AppPaths.LibCronetDll))
             _log.Info("NaiveProxy dependency libcronet.dll present");

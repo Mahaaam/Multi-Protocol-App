@@ -27,7 +27,13 @@ public sealed class ProtocolMethod
     public required int Port { get; init; }
     public required string Network { get; init; } // tcp / udp / both
     public string? SkipReason { get; set; }
-    public bool IsSkipped => !string.IsNullOrEmpty(SkipReason);
+
+    /// <summary>True only for permanent catalog/engine skips — not transient dependency skips.</summary>
+    public bool IsPermanentlyUnsupported =>
+        Id is "F01" or "F02" ||
+        FailureKind == FailureKind.Unsupported ||
+        (!string.IsNullOrEmpty(SkipReason) &&
+         SkipReason.StartsWith("Port key missing", StringComparison.OrdinalIgnoreCase));
 
     public TestStatus Status { get; set; } = TestStatus.Pending;
     public double LatencyMs { get; set; }
@@ -49,8 +55,11 @@ public sealed class ProtocolMethod
     {
         TestStatus.Pass when IsHistorical => "Pass (cached)",
         TestStatus.Pass => "Pass",
+        TestStatus.Fail when IsHistorical => "Fail (cached)",
         TestStatus.Fail => "Fail",
+        TestStatus.Unverified when IsHistorical => "Unverified (cached)",
         TestStatus.Unverified => "Unverified",
+        TestStatus.Skipped when IsHistorical => "Skipped (cached)",
         TestStatus.Skipped => "Skipped",
         TestStatus.Pending => "Pending",
         _ => Status.ToString()
