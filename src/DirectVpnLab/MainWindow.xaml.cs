@@ -24,6 +24,8 @@ public partial class MainWindow : Window
     private SpeedTestResult? _directSpeed;
     private SpeedTestResult? _vpnSpeed;
     private double _pulse;
+    private bool _closingCleanupDone;
+    private int _healthGate; // 0=idle, 1=running
 
     public MainWindow()
     {
@@ -54,10 +56,11 @@ public partial class MainWindow : Window
         _healthTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(25) };
         _healthTimer.Tick += async (_, _) => await HealthTickAsync();
 
-        Loaded += (_, _) =>
+        Loaded += async (_, _) =>
         {
             _log.Info("Application started");
             _log.Info("Windows network detected");
+            await _connection.RecoverOrphansAsync();
             _log.Info($"sing-box asset: {(File.Exists(AppPaths.SingBoxExe) ? "found" : "MISSING")}");
             _log.Info($"Credentials loaded for server {_cred.server_ip}");
             if (!ConnectionService.IsAdministrator())
@@ -67,15 +70,34 @@ public partial class MainWindow : Window
             SetUiState(ConnectionUiState.Disconnected);
         };
 
-        Closing += async (_, e) =>
+        Closing += OnClosing;
+    }
+
+    private async void OnClosing(object? sender, System.ComponentModel.CancelEventArgs e)
+    {
+        if (_closingCleanupDone)
         {
-            try
-            {
-                _cts?.Cancel();
-                await _connection.DisconnectAsync();
-            }
-            catch { /* ignore */ }
-        };
+            return;
+        }
+
+        e.Cancel = true;
+        _healthTimer.Stop();
+        _pulseTimer.Stop();
+        SetBusy(true);
+        try
+        {
+            _cts?.Cancel();
+            await _connection.DisconnectAsync();
+            _closingCleanupDone = true;
+            _log.Info("Shutdown cleanup finished");
+            Close();
+        }
+        catch (Exception ex)
+        {
+            _closingCleanupDone = true;
+            _log.Error($"Shutdown cleanup error: {ex.Message}");
+            Close();
+        }
     }
 
     private async void Connect_Click(object sender, RoutedEventArgs e)
@@ -86,7 +108,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (_uiState is ConnectionUiState.Testing or ConnectionUiState.Connecting)
+        if (_uiState is ConnectionUiState.Testing or ConnectionUiState.Connecting or ConnectionUiState.Degraded)
         {
             return;
         }
@@ -103,18 +125,16 @@ public partial class MainWindow : Window
             await discovery.RunAsync(_methods.ToList(), progress, ct);
             RefreshGrid();
 
-            var passed = _methods.Where(m => m.Status == TestStatus.Pass).OrderBy(m => m.Rank).ToList();
-            if (passed.Count == 0)
-            {
-                // allow unverified endpoints as last resort candidates
-                passed = _methods.Where(m => m.Status is TestStatus.Pass or TestStatus.Unverified)
-                    .OrderBy(m => m.Rank == 0 ? 999 : m.Rank).ToList();
-            }
+            // Only PASS methods may enter auto-connect.
+            var passed = _methods
+                .Where(m => m.Status == TestStatus.Pass)
+                .OrderBy(m => m.Rank)
+                .ToList();
 
             if (passed.Count == 0)
             {
                 SetUiState(ConnectionUiState.Failed);
-                _log.Fail("CONNECTION FAILED");
+                _log.Fail("CONNECTION FAILED - no PASS methods");
                 return;
             }
 
@@ -122,7 +142,7 @@ public partial class MainWindow : Window
             var sw = System.Diagnostics.Stopwatch.StartNew();
             var (ok, msg) = await _connection.ConnectBestAsync(passed, ct);
             sw.Stop();
-            if (!ok)
+            if (!ok || !_connection.IsConnected)
             {
                 SetUiState(ConnectionUiState.Failed);
                 _log.Fail(msg);
@@ -158,7 +178,7 @@ public partial class MainWindow : Window
 
     private async void TestAll_Click(object sender, RoutedEventArgs e)
     {
-        if (_uiState is ConnectionUiState.Testing or ConnectionUiState.Connecting) return;
+        if (_uiState is ConnectionUiState.Testing or ConnectionUiState.Connecting or ConnectionUiState.Degraded) return;
         _cts?.Cancel();
         _cts = new CancellationTokenSource();
         SetBusy(true);
@@ -189,17 +209,13 @@ public partial class MainWindow : Window
             if (!_connection.IsConnected)
             {
                 _directSpeed = await _speed.RunAsync("DIRECT", null, null, CancellationToken.None);
-                TxtSpeedDirect.Text =
-                    $"DIRECT: ↓ {_directSpeed.DownloadMbps:F2} Mbps  ↑ {_directSpeed.UploadMbps:F2} Mbps  " +
-                    $"lat {_directSpeed.LatencyMs:F0} ms  jitter {_directSpeed.JitterMs:F0} ms";
+                TxtSpeedDirect.Text = FormatSpeed("DIRECT", _directSpeed);
             }
             else
             {
                 var p = _connection.ActiveMethod;
                 _vpnSpeed = await _speed.RunAsync("VPN", p?.DisplayName, null, CancellationToken.None);
-                TxtSpeedVpn.Text =
-                    $"VPN ({p?.Protocol}): ↓ {_vpnSpeed.DownloadMbps:F2} Mbps  ↑ {_vpnSpeed.UploadMbps:F2} Mbps  " +
-                    $"lat {_vpnSpeed.LatencyMs:F0} ms  jitter {_vpnSpeed.JitterMs:F0} ms";
+                TxtSpeedVpn.Text = FormatSpeed($"VPN ({p?.Protocol})", _vpnSpeed);
             }
         }
         catch (Exception ex)
@@ -210,6 +226,16 @@ public partial class MainWindow : Window
         {
             SetBusy(false);
         }
+    }
+
+    private static string FormatSpeed(string label, SpeedTestResult r)
+    {
+        if (!r.Success)
+        {
+            return $"{label}: FAILED — {r.Error}";
+        }
+        return $"{label}: ↓ {r.DownloadMbps:F2} Mbps  ↑ {r.UploadMbps:F2} Mbps  " +
+               $"lat {r.LatencyMs:F0} ms  jitter {r.JitterMs:F0} ms";
     }
 
     private async void Disconnect_Click(object sender, RoutedEventArgs e) => await DoDisconnectAsync();
@@ -225,42 +251,56 @@ public partial class MainWindow : Window
 
     private async Task HealthTickAsync()
     {
-        if (!_connection.IsConnected) return;
+        if (Interlocked.CompareExchange(ref _healthGate, 1, 0) != 0)
+        {
+            return; // overlap prevention
+        }
+
         try
         {
-            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(12) };
-            using var resp = await client.GetAsync("https://1.1.1.1/cdn-cgi/trace");
-            if (!resp.IsSuccessStatusCode)
+            if (!_connection.IsConnected)
             {
-                throw new Exception($"status {(int)resp.StatusCode}");
+                if (_uiState == ConnectionUiState.Connected)
+                {
+                    SetUiState(ConnectionUiState.Failed);
+                    _log.Fail("Connection no longer verified");
+                }
+                return;
             }
-        }
-        catch (Exception ex)
-        {
-            _log.Warn($"Health check failed: {ex.Message}");
-            SetUiState(ConnectionUiState.Degraded);
-            _log.Info("Attempting controlled recovery of active method");
-            var active = _connection.ActiveMethod;
-            await _connection.DisconnectAsync();
-            var ranked = _methods.Where(m => m.Status == TestStatus.Pass).OrderBy(m => m.Rank).ToList();
-            if (active != null)
-            {
-                ranked = ranked.OrderBy(m => m.Id == active.Id ? 0 : 1).ThenBy(m => m.Rank).ToList();
-            }
-            var (ok, msg) = await _connection.ConnectBestAsync(ranked, CancellationToken.None);
+
+            var (ok, exitIp, detail) = await _connection.VerifyHealthAsync(CancellationToken.None);
             if (ok)
+            {
+                return;
+            }
+
+            _log.Warn($"Health check failed: {detail}");
+            SetUiState(ConnectionUiState.Degraded);
+            _log.Info("Attempting controlled recovery after cleanup of previous method");
+
+            var ranked = _methods.Where(m => m.Status == TestStatus.Pass).OrderBy(m => m.Rank).ToList();
+            await _connection.DisconnectAsync();
+
+            var (reOk, msg) = await _connection.ConnectBestAsync(ranked, CancellationToken.None);
+            if (reOk && _connection.IsConnected)
             {
                 SetUiState(ConnectionUiState.Connected);
                 var a = _connection.ActiveMethod!;
                 TxtProtocol.Text = $"Protocol: {a.Protocol}";
                 TxtTransport.Text = $"Transport: {a.Transport}";
-                TxtExitIp.Text = $"Exit IP: {a.ExitIp ?? "—"}";
+                TxtExitIp.Text = $"Exit IP: {a.ExitIp ?? exitIp ?? "—"}";
+                TxtConnStatus.Text = "Status: Connected";
             }
             else
             {
+                ClearConnInfo();
                 SetUiState(ConnectionUiState.Failed);
                 _log.Fail(msg);
             }
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _healthGate, 0);
         }
     }
 
@@ -282,13 +322,12 @@ public partial class MainWindow : Window
         if (dlg.ShowDialog() == true)
         {
             File.WriteAllText(dlg.FileName, _log.ExportSanitized());
-            _log.Info($"Log exported to file");
+            _log.Info("Log exported to file");
         }
     }
 
     private void RefreshGrid()
     {
-        GridMethods.Items.Refresh();
         var view = _methods
             .Where(m => m.Status is TestStatus.Pass or TestStatus.Unverified or TestStatus.Fail or TestStatus.Skipped)
             .OrderBy(m => m.Status == TestStatus.Pass ? 0 : 1)

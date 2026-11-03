@@ -36,7 +36,7 @@ public sealed class DiscoveryService
                 continue;
             }
 
-            // Endpoint-based methods: limited proxy discovery may be unsupported
+            // Endpoint methods: never PASS without real data-path proof
             if (m.Id is "E04" or "F03" or "F04")
             {
                 await TestEndpointAsync(m, ct);
@@ -73,18 +73,23 @@ public sealed class DiscoveryService
             m.ConnectTimeMs = swConnect.Elapsed.TotalMilliseconds;
 
             var latencies = new List<double>();
+            var verifiedIps = new List<string>();
             var ok = 0;
-            string? exitIp = null;
             for (var i = 0; i < 3; i++)
             {
                 ct.ThrowIfCancellationRequested();
                 var (success, latency, ip, err) = await ProbeViaProxyAsync(port, ct);
-                if (success)
+                if (success && IsExactExpectedExit(ip))
                 {
                     ok++;
                     latencies.Add(latency);
-                    exitIp ??= ip;
+                    verifiedIps.Add(ip!);
                     _log.Info($"Probe {i + 1}/3 OK latency={latency:F0}ms exit={ip}");
+                }
+                else if (success)
+                {
+                    _log.Warn($"Probe {i + 1}/3 Exit IP Mismatch: got={ip} expected={_cred.server_ip}");
+                    m.LastError = $"Exit IP Mismatch: {ip}";
                 }
                 else
                 {
@@ -97,13 +102,12 @@ public sealed class DiscoveryService
             if (latencies.Count > 0)
             {
                 m.LatencyMs = latencies.Average();
-                m.JitterMs = latencies.Count > 1
-                    ? StdDev(latencies)
-                    : 0;
+                m.JitterMs = latencies.Count > 1 ? StdDev(latencies) : 0;
             }
-            m.ExitIp = exitIp;
+            m.ExitIp = verifiedIps.FirstOrDefault();
 
-            if (ok > 0 && IsExpectedExit(exitIp))
+            // PASS only with >=2/3 successes AND exact exit IP
+            if (ok >= 2 && IsExactExpectedExit(m.ExitIp))
             {
                 m.Status = TestStatus.Pass;
                 _log.Pass($"PASS - {m.Id} {m.DisplayName}");
@@ -111,8 +115,8 @@ public sealed class DiscoveryService
             else if (ok > 0)
             {
                 m.Status = TestStatus.Unverified;
-                m.LastError = "Exit IP mismatch or incomplete verification";
-                _log.Fail($"UNVERIFIED - {m.Id}: Exit IP Mismatch ({exitIp})");
+                m.LastError ??= "Incomplete verification (<2/3 probes or exit IP incomplete)";
+                _log.Fail($"UNVERIFIED - {m.Id}: {m.LastError}");
             }
             else
             {
@@ -140,13 +144,10 @@ public sealed class DiscoveryService
 
     private async Task TestEndpointAsync(ProtocolMethod m, CancellationToken ct)
     {
-        _log.Info($"Testing endpoint method {m.Id} {m.DisplayName} (isolated tun-less dial check)");
-        // For v1: mark as UNVERIFIED unless a lightweight sing-box check config validates.
-        // Full verification happens during TUN connect stage.
+        _log.Info($"Testing endpoint method {m.Id} {m.DisplayName}");
         try
         {
             var cfg = ConfigFactory.BuildTunConfig(_cred, m, AppPaths.WorkDir);
-            // Only validate config parse via sing-box check
             var psi = new ProcessStartInfo
             {
                 FileName = AppPaths.SingBoxExe,
@@ -167,9 +168,10 @@ public sealed class DiscoveryService
             }
             else
             {
+                // Config parses, but no real data-path proof => never PASS
                 m.Status = TestStatus.Unverified;
-                m.LastError = "Endpoint requires TUN stage for full verification";
-                _log.Warn($"UNVERIFIED - {m.Id}: will try during connect ranking if selected");
+                m.LastError = "Endpoint has no isolated data-path proof; not eligible for auto-connect";
+                _log.Warn($"UNVERIFIED - {m.Id}: no PASS without real traffic proof");
             }
             try { File.Delete(cfg); } catch { /* ignore */ }
         }
@@ -186,14 +188,13 @@ public sealed class DiscoveryService
         var handler = new HttpClientHandler
         {
             Proxy = new WebProxy($"http://127.0.0.1:{mixedPort}"),
-            UseProxy = true,
-            ServerCertificateCustomValidationCallback = (_, _, _, _) => true // destination sites, not lab TLS
+            UseProxy = true
+            // Standard HTTPS certificate validation remains enabled (no bypass).
         };
         using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(18) };
         var sw = Stopwatch.StartNew();
         try
         {
-            // Dual destination: Cloudflare trace + ipify
             using var r1 = await client.GetAsync("https://1.1.1.1/cdn-cgi/trace", ct);
             if (!r1.IsSuccessStatusCode)
             {
@@ -202,14 +203,14 @@ public sealed class DiscoveryService
             var body = await r1.Content.ReadAsStringAsync(ct);
             sw.Stop();
 
-            string? ip = null;
+            string? ip;
             try
             {
                 ip = (await client.GetStringAsync("https://api.ipify.org", ct)).Trim();
             }
-            catch
+            catch (Exception ex)
             {
-                // fallback parse from trace
+                ip = null;
                 foreach (var line in body.Split('\n'))
                 {
                     if (line.StartsWith("ip=", StringComparison.OrdinalIgnoreCase))
@@ -217,6 +218,10 @@ public sealed class DiscoveryService
                         ip = line[3..].Trim();
                         break;
                     }
+                }
+                if (ip == null)
+                {
+                    return (false, sw.Elapsed.TotalMilliseconds, null, $"Exit IP fetch failed: {ex.Message}");
                 }
             }
 
@@ -240,9 +245,9 @@ public sealed class DiscoveryService
         }
     }
 
-    private bool IsExpectedExit(string? ip) =>
+    private bool IsExactExpectedExit(string? ip) =>
         !string.IsNullOrWhiteSpace(ip) &&
-        (ip == _cred.server_ip || ip.StartsWith("82.23.248.", StringComparison.Ordinal));
+        string.Equals(ip.Trim(), _cred.server_ip.Trim(), StringComparison.Ordinal);
 
     private static void ClassifyFailure(ProtocolMethod m, string detail)
     {
@@ -253,7 +258,6 @@ public sealed class DiscoveryService
         else if (d.Contains("dns")) m.LastError = "DNS Error";
         else if (d.Contains("udp")) m.LastError = "UDP Timeout";
         else if (string.IsNullOrWhiteSpace(m.LastError)) m.LastError = "Server Unreachable or protocol failure";
-        // Note: Timeout alone does not prove filtering.
     }
 
     public static void Rank(IReadOnlyList<ProtocolMethod> methods)
@@ -261,8 +265,7 @@ public sealed class DiscoveryService
         var passed = methods.Where(x => x.Status == TestStatus.Pass).ToList();
         foreach (var m in passed)
         {
-            // Higher is better. Transparent formula.
-            var latencyScore = Math.Max(0, 100 - m.LatencyMs / 10.0);       // 0ms=>100, 1000ms=>0
+            var latencyScore = Math.Max(0, 100 - m.LatencyMs / 10.0);
             var jitterScore = Math.Max(0, 100 - m.JitterMs / 5.0);
             var connectScore = Math.Max(0, 100 - m.ConnectTimeMs / 20.0);
             var successScore = m.SuccessRate * 100;
@@ -271,7 +274,7 @@ public sealed class DiscoveryService
                 latencyScore * 0.25 +
                 jitterScore * 0.15 +
                 connectScore * 0.10 +
-                10.0; // stability base for PASS
+                10.0;
         }
 
         var ordered = passed

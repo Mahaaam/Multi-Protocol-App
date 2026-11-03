@@ -1,11 +1,11 @@
 using System.Collections.ObjectModel;
 using System.Text;
-using System.Windows;
+using System.Text.RegularExpressions;
 using System.Windows.Threading;
 
 namespace DirectVpnLab.Services;
 
-public sealed class LiveLogService
+public sealed partial class LiveLogService
 {
     private readonly Dispatcher _dispatcher;
     private readonly object _gate = new();
@@ -27,7 +27,6 @@ public sealed class LiveLogService
 
     public void Append(string level, string message)
     {
-        // Never log secrets/tokens
         var sanitized = Sanitize(message);
         var line = $"[{DateTime.Now:HH:mm:ss}] [{level}] {sanitized}";
         lock (_gate)
@@ -55,26 +54,43 @@ public sealed class LiveLogService
     {
         lock (_gate)
         {
-            return _all.ToString();
+            return Sanitize(_all.ToString());
         }
     }
 
-    private static string Sanitize(string message)
+    internal static string Sanitize(string message)
     {
-        // Defensive redaction for accidental secret dumps
+        if (string.IsNullOrEmpty(message)) return message;
         var m = message;
-        string[] keys =
-        [
-            "password", "private_key", "uuid", "token", "credential", "secret"
-        ];
-        foreach (var k in keys)
-        {
-            // keep labels, strip values after '=' when key appears
-            if (m.Contains(k, StringComparison.OrdinalIgnoreCase) && m.Contains('='))
-            {
-                // leave structural messages alone unless clearly key=value
-            }
-        }
+
+        // key=value / key: value for sensitive keys
+        m = SensitiveKvRegex().Replace(m, "$1=[REDACTED]");
+        // PEM blocks
+        m = PemRegex().Replace(m, "[REDACTED_PEM]");
+        // Long base64-looking tokens (keys/passwords)
+        m = LongSecretRegex().Replace(m, "[REDACTED]");
+        // UUID literals when labeled nearby already handled; also bare bearer tokens
+        m = BearerRegex().Replace(m, "Bearer [REDACTED]");
         return m;
     }
+
+    [GeneratedRegex(
+        @"(?i)\b(password|passwd|pwd|token|secret|credential|api[_-]?key|private[_-]?key|privateKey|uuid|authorization)\b\s*([:=]\s*)([^\s,;""']+)",
+        RegexOptions.Compiled)]
+    private static partial Regex SensitiveKvRegex();
+
+    [GeneratedRegex(
+        @"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+        RegexOptions.Compiled)]
+    private static partial Regex PemRegex();
+
+    [GeneratedRegex(
+        @"\b(?:[A-Za-z0-9+/]{40,}={0,2})\b",
+        RegexOptions.Compiled)]
+    private static partial Regex LongSecretRegex();
+
+    [GeneratedRegex(
+        @"(?i)\bBearer\s+[A-Za-z0-9\-._~+/]+=*",
+        RegexOptions.Compiled)]
+    private static partial Regex BearerRegex();
 }

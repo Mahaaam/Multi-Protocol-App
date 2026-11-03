@@ -1,6 +1,6 @@
 # Project Status — Direct VPN Lab
 
-Last updated: 2026-11-03
+Last updated: 2026-11-03 (critical validation fixes applied; VPN PASS not claimed)
 
 ## Versions
 
@@ -82,12 +82,24 @@ specific results only.
 - Standalone EXE (~207MB) is built locally; not stored in git  
 - Lab credentials must be supplied privately via sample file copy  
 
+## Critical fixes applied (post-review)
+
+- Discovery: standard HTTPS validation; PASS requires ≥2/3 probes + exact exit IP  
+- Discovery: endpoint methods never auto-PASS without data-path proof  
+- Connect: only `TestStatus.Pass` candidates; TUN interface + HTTPS + exact exit IP required  
+- Lifecycle: Closing waits for cleanup; orphan PID recovery; health-check overlap gate  
+- Speed Test: failed HTTP is not treated as Mbps=0 success  
+- Live Log: real secret redaction  
+
+Operator must still manually verify VPN/TUN before any `VPN_VERIFIED` / final PASS claim.
+
 ## Incomplete / next work
 
-1. Run EXE as Administrator and complete TUN verification checklist  
+1. Operator TUN/VPN manual verification checklist  
 2. Batch-probe remaining installed TCP/UDP methods  
 3. Formal Iran network confirmation with country evidence  
 4. Optional move to sing-box 1.15+ for MASQUE experiments on a safe path  
+
 
 ## Delivery flags (current)
 

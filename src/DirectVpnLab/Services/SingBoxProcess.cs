@@ -15,6 +15,7 @@ public sealed class SingBoxProcess : IAsyncDisposable
     }
 
     public bool IsRunning => _process is { HasExited: false };
+    public int? ProcessId => _process is { HasExited: false } ? _process.Id : null;
     public string StderrSnapshot
     {
         get

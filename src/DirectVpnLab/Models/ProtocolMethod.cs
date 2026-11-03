@@ -45,11 +45,13 @@ public sealed class ProtocolMethod
 public sealed class SpeedTestResult
 {
     public required string Route { get; init; }
-    public double DownloadMbps { get; init; }
-    public double UploadMbps { get; init; }
-    public double LatencyMs { get; init; }
-    public double JitterMs { get; init; }
+    public double? DownloadMbps { get; init; }
+    public double? UploadMbps { get; init; }
+    public double? LatencyMs { get; init; }
+    public double? JitterMs { get; init; }
     public string? Protocol { get; init; }
+    public bool Success { get; init; }
+    public string? Error { get; init; }
     public DateTime Timestamp { get; init; } = DateTime.Now;
 }
 
