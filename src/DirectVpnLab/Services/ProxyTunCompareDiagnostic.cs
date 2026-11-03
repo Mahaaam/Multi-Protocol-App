@@ -23,6 +23,9 @@ public sealed class ProxyTunCompareDiagnostic
 
     private static readonly TimeSpan OverallBudget = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan StallIdle = TimeSpan.FromSeconds(3);
+    /// <summary>PROXY-ONLY root-cause mode: wait longer after last byte to see if transfer recovers.</summary>
+    public static readonly TimeSpan ProxyOnlyStallIdle = TimeSpan.FromSeconds(15);
+    public static readonly TimeSpan ProxyOnlyOverallBudget = TimeSpan.FromSeconds(45);
     private static readonly TimeSpan ExitIpBudget = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan TcpProbeBudget = TimeSpan.FromSeconds(5);
 
@@ -316,7 +319,169 @@ public sealed class ProxyTunCompareDiagnostic
         };
     }
 
-    private async Task<LegResult> RunProxyOnlyAsync(ProtocolMethod c01, CancellationToken ct)
+    /// <summary>
+    /// Isolated PROXY-only session (no TUN / no Windows route-DNS mutation).
+    /// Longer stall window for TCP root-cause correlation with server-side ss sampling.
+    /// </summary>
+    public async Task<CompareReport> RunProxyOnlySessionAsync(ProtocolMethod c01, CancellationToken ct)
+    {
+        if (!string.Equals(c01.Id, MethodId, StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("Diagnostic is locked to C01 only", nameof(c01));
+
+        var runId = $"diag-proxyonly-{DateTime.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid().ToString("N")[..8]}";
+        var started = DateTime.UtcNow;
+        var serverPort = c01.Port > 0 ? c01.Port : C01ServerPort;
+        var netFp = PersistenceService.CaptureNetworkFingerprint();
+
+        var otherVpn = DetectOtherVpnAdapters();
+        if (otherVpn.Count > 0)
+        {
+            var msg = "Aborted: other VPN adapter(s) active: " + string.Join(", ", otherVpn);
+            _log.Fail(msg);
+            return AbortReport(runId, started, netFp, serverPort, msg, "Cannot run PROXY-only while another VPN is active.", "high");
+        }
+
+        await _connection.DisconnectAsync().ConfigureAwait(false);
+
+        _log.Info($"=== DIAG C01 PROXY-ONLY RUN {runId} START ===");
+        _log.Info(
+            $"No TUN/route/DNS changes. URL={DownloadUrl} target={TargetBytes}B " +
+            $"stallIdle={ProxyOnlyStallIdle.TotalSeconds:F0}s budget={ProxyOnlyOverallBudget.TotalSeconds:F0}s");
+
+        var (tcpStatus, tcpDetail) = await ProbeTcpAsync(_cred.server_ip, serverPort, TcpProbeBudget, ct)
+            .ConfigureAwait(false);
+        _log.Info($"[TCP direct→{_cred.server_ip}:{serverPort}] status={tcpStatus} detail={tcpDetail}");
+
+        LegResult? direct = null;
+        try
+        {
+            _log.Info("DIRECT baseline (informational)");
+            direct = await MeasureTransferAsync(
+                    "DIRECT", proxyPort: null, engineStderr: null, ct,
+                    stallIdle: StallIdle, overallBudget: OverallBudget, requireExactBytes: false)
+                .ConfigureAwait(false);
+            direct = CloneWithTcp(direct, tcpStatus, tcpDetail);
+            LogLeg(direct);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Direct baseline error (ignored for VPN verdict): {ex.Message}");
+        }
+
+        LegResult proxy;
+        var cleanupOk = true;
+        var cleanupDetail = "ok";
+        try
+        {
+            proxy = await RunProxyOnlyAsync(
+                    c01, ct,
+                    stallIdle: ProxyOnlyStallIdle,
+                    overallBudget: ProxyOnlyOverallBudget,
+                    requireExactBytes: true)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            var cat = ClassifyException(ex);
+            proxy = new LegResult
+            {
+                Mode = "PROXY",
+                Outcome = "FAIL",
+                DownloadStatus = "NOT_RUN",
+                ExitIpStatus = "NOT_RUN",
+                ErrorCategory = cat,
+                ErrorDetail = ex.Message,
+                DownloadCategory = cat,
+                DownloadError = ex.Message
+            };
+            _log.Fail($"PROXY-only exception [{cat}]: {ex.Message}");
+        }
+        finally
+        {
+            var (ok, msg) = await _connection.DisconnectAsync().ConfigureAwait(false);
+            cleanupOk = ok;
+            cleanupDetail = msg;
+        }
+
+        LogLeg(proxy);
+        var finished = DateTime.UtcNow;
+        var hypothesis = proxy.DownloadStatus == "PASS" && proxy.ExitIpStatus == "OK"
+            ? "PROXY-only transfer PASS with NL exit — still not Full VPN PASS; TUN/browser untested in this mode."
+            : proxy.DownloadStatus is "STALL" or "TIMEOUT"
+                ? "PROXY-only stalled after partial bytes — correlate with server ss -ti / limited TCP metadata for this runId."
+                : $"PROXY-only outcome={proxy.Outcome} dl={proxy.DownloadStatus} exit={proxy.ExitIpStatus}.";
+        var confidence = proxy.DownloadStatus is "PASS" or "STALL" ? "medium" : "low";
+        var summary =
+            $"PROXY-ONLY={proxy.Outcome} dl={proxy.DownloadStatus}/{proxy.BytesReceived}B exit={proxy.ExitIpStatus} " +
+            $"tcpDirect={tcpStatus} cleanup={(cleanupOk ? "OK" : "FAIL")}";
+
+        _log.Info($"=== DIAG C01 PROXY-ONLY RUN {runId} RESULT ===");
+        _log.Info(summary);
+        _log.Info($"hypothesis[{confidence}]: {hypothesis}");
+
+        try
+        {
+            var outPath = Path.Combine(AppPaths.LogDir, $"diag-c01-{runId}.json");
+            var latestPath = Path.Combine(AppPaths.LogDir, "diag-c01-proxy-only.json");
+            var payload = new
+            {
+                runId,
+                mode = "PROXY_ONLY",
+                startedAtUtc = started,
+                finishedAtUtc = finished,
+                networkFingerprint = netFp,
+                serverIp = _cred.server_ip,
+                serverPort,
+                url = DownloadUrl,
+                targetBytes = TargetBytes,
+                stallIdleSeconds = ProxyOnlyStallIdle.TotalSeconds,
+                overallBudgetSeconds = ProxyOnlyOverallBudget.TotalSeconds,
+                tcpConnectDirect = new { status = tcpStatus, detail = tcpDetail },
+                directBaseline = Sanitize(direct),
+                proxyResult = Sanitize(proxy),
+                tunResult = (object?)null,
+                cleanupOk,
+                cleanupDetail,
+                summary,
+                hypothesis,
+                confidence
+            };
+            var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(outPath, json);
+            File.WriteAllText(latestPath, json);
+            _log.Info($"Wrote PROXY-only report: {outPath}");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Could not write PROXY-only JSON: {ex.Message}");
+        }
+
+        return new CompareReport
+        {
+            RunId = runId,
+            StartedAtUtc = started,
+            FinishedAtUtc = finished,
+            NetworkFingerprint = netFp,
+            ServerIp = _cred.server_ip,
+            ServerPort = serverPort,
+            DirectBaseline = direct,
+            Proxy = proxy,
+            Tun = new LegResult { Mode = "TUN", Outcome = "NOT_RUN", DownloadStatus = "NOT_RUN", ExitIpStatus = "NOT_RUN" },
+            CleanupOk = cleanupOk,
+            CleanupDetail = cleanupDetail,
+            Summary = summary,
+            Hypothesis = hypothesis,
+            Confidence = confidence,
+            NextStep = "Correlate with server ss -ti samples for this runId; do not run TUN/TEST ALL in this investigation."
+        };
+    }
+
+    private async Task<LegResult> RunProxyOnlyAsync(
+        ProtocolMethod c01,
+        CancellationToken ct,
+        TimeSpan? stallIdle = null,
+        TimeSpan? overallBudget = null,
+        bool requireExactBytes = false)
     {
         _log.Info("DIAG A — PROXY ONLY (mixed inbound, no Windows route/DNS change)");
         var port = FreeTcpPort();
@@ -325,7 +490,9 @@ public sealed class ProxyTunCompareDiagnostic
         await sb.StartAsync(cfg, ct, readyDelayMs: 280).ConfigureAwait(false);
         try
         {
-            return await MeasureTransferAsync("PROXY", proxyPort: port, engineStderr: () => sb.StderrSnapshot, ct)
+            return await MeasureTransferAsync(
+                    "PROXY", proxyPort: port, engineStderr: () => sb.StderrSnapshot, ct,
+                    stallIdle: stallIdle, overallBudget: overallBudget, requireExactBytes: requireExactBytes)
                 .ConfigureAwait(false);
         }
         finally
@@ -408,8 +575,14 @@ public sealed class ProxyTunCompareDiagnostic
         string mode,
         int? proxyPort,
         Func<string>? engineStderr,
-        CancellationToken ct)
+        CancellationToken ct,
+        TimeSpan? stallIdle = null,
+        TimeSpan? overallBudget = null,
+        bool requireExactBytes = false)
     {
+        var stall = stallIdle ?? StallIdle;
+        var budgetLimit = overallBudget ?? OverallBudget;
+
         var handler = new HttpClientHandler
         {
             AllowAutoRedirect = false,
@@ -428,7 +601,7 @@ public sealed class ProxyTunCompareDiagnostic
 
         using var client = new HttpClient(handler)
         {
-            Timeout = OverallBudget + TimeSpan.FromSeconds(5)
+            Timeout = budgetLimit + TimeSpan.FromSeconds(5)
         };
         client.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Encoding", "identity");
         client.DefaultRequestHeaders.TryAddWithoutValidation("Cache-Control", "no-cache");
@@ -495,7 +668,7 @@ public sealed class ProxyTunCompareDiagnostic
 
         // --- Download (always attempted unless cancelled) ---
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        budget.CancelAfter(OverallBudget);
+        budget.CancelAfter(budgetLimit);
         var sw = Stopwatch.StartNew();
         double? firstByteMs = null;
         double? lastProgressMs = null;
@@ -506,6 +679,7 @@ public sealed class ProxyTunCompareDiagnostic
         string? downloadErr = null;
         string tlsStatus = tlsFromExit;
         string? engineHint = null;
+        var passFloor = requireExactBytes ? TargetBytes : (long)(TargetBytes * 0.95);
 
         try
         {
@@ -542,7 +716,7 @@ public sealed class ProxyTunCompareDiagnostic
                     // Cap each read wait so we can detect stall promptly after first byte
                     var slice = firstByteMs == null
                         ? TimeSpan.FromSeconds(8)
-                        : StallIdle;
+                        : stall;
                     readCts.CancelAfter(slice);
 
                     int n;
@@ -555,17 +729,17 @@ public sealed class ProxyTunCompareDiagnostic
                     {
                         if (firstByteMs != null &&
                             lastProgressMs != null &&
-                            sw.Elapsed.TotalMilliseconds - lastProgressMs.Value >= StallIdle.TotalMilliseconds)
+                            sw.Elapsed.TotalMilliseconds - lastProgressMs.Value >= stall.TotalMilliseconds)
                         {
                             downloadStatus = "STALL";
                             downloadCat = "DOWNLOAD_STALL";
                             downloadErr =
-                                $"No new bytes for >{StallIdle.TotalSeconds:F0}s after {got}B (lastProgress={lastProgressMs:F0}ms)";
+                                $"No new bytes for >{stall.TotalSeconds:F0}s after {got}B (lastProgress={lastProgressMs:F0}ms)";
                         }
                         else if (budget.IsCancellationRequested)
                         {
                             downloadStatus = got > 0 ? "TIMEOUT" : "FAIL";
-                            downloadCat = got > 0 ? "DOWNLOAD_TIMEOUT" : "DOWNLOAD_TIMEOUT";
+                            downloadCat = "DOWNLOAD_TIMEOUT";
                             downloadErr = $"Overall budget after {got}B";
                         }
                         else
@@ -580,7 +754,7 @@ public sealed class ProxyTunCompareDiagnostic
 
                     if (n <= 0)
                     {
-                        if (got < TargetBytes * 0.95)
+                        if (got < passFloor)
                         {
                             downloadStatus = "FAIL";
                             downloadCat = "HTTP_FAILED";
@@ -596,7 +770,7 @@ public sealed class ProxyTunCompareDiagnostic
 
                 if (downloadStatus == "NOT_RUN")
                 {
-                    if (got >= (long)(TargetBytes * 0.95))
+                    if (got >= passFloor)
                     {
                         downloadStatus = "PASS";
                         downloadCat = null;

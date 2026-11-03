@@ -122,7 +122,7 @@
             <Run Text="  ·  "/>
             <Run Text="82.23.248.121"/>
             <Run Text="  ·  "/>
-            <Run Text="v1.1.9"/>
+            <Run Text="v1.1.10"/>
           </TextBlock>
           <TextBlock x:Name="TxtPersistMeta" Margin="0,4,0,0" Foreground="{StaticResource Muted}" FontSize="11"
                      Text="Results: none saved yet"/>
@@ -134,6 +134,8 @@
           <Button Style="{StaticResource ActionBtn}" Content="SPEED TEST" Click="SpeedTest_Click" x:Name="BtnSpeed"/>
           <Button Style="{StaticResource ActionBtn}" Content="DIAG C01" Click="DiagC01_Click" x:Name="BtnDiagC01"
                   ToolTip="A/B: C01 proxy-only vs full TUN — same 256KiB URL"/>
+          <Button Style="{StaticResource ActionBtn}" Content="DIAG C01 PROXY ONLY" Click="DiagC01ProxyOnly_Click" x:Name="BtnDiagC01ProxyOnly"
+                  ToolTip="Isolated C01 mixed-proxy download — no TUN/route/DNS changes"/>
         </StackPanel>
       </Grid>
     </Border>
