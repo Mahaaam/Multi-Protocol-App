@@ -223,7 +223,7 @@ public sealed class PersistenceService
 
     public IReadOnlyList<string> GetTunFailureIdsForNetwork(PersistedLabState state, string networkFp)
     {
-        PruneStaleTunFailures(state, networkFp);
+        PruneAgedTunFailures(state);
         return state.TunFailures
             .Where(f => string.Equals(f.NetworkFingerprint, networkFp, StringComparison.OrdinalIgnoreCase))
             .Select(f => f.MethodId)
@@ -233,7 +233,7 @@ public sealed class PersistenceService
 
     public void RecordTunFailure(PersistedLabState state, string methodId, string networkFp, string category, string detail)
     {
-        PruneStaleTunFailures(state, networkFp);
+        PruneAgedTunFailures(state);
         state.TunFailures.RemoveAll(f =>
             string.Equals(f.MethodId, methodId, StringComparison.OrdinalIgnoreCase) &&
             string.Equals(f.NetworkFingerprint, networkFp, StringComparison.OrdinalIgnoreCase));
@@ -260,12 +260,10 @@ public sealed class PersistenceService
             string.Equals(f.NetworkFingerprint, networkFp, StringComparison.OrdinalIgnoreCase));
     }
 
-    private static void PruneStaleTunFailures(PersistedLabState state, string currentFp)
+    private static void PruneAgedTunFailures(PersistedLabState state)
     {
-        // Drop failures from other networks; keep current-network failures up to 24h
-        state.TunFailures.RemoveAll(f =>
-            !string.Equals(f.NetworkFingerprint, currentFp, StringComparison.OrdinalIgnoreCase) ||
-            DateTime.UtcNow - f.FailedAtUtc > TimeSpan.FromHours(24));
+        // Keep per-network history; only drop entries older than 24h
+        state.TunFailures.RemoveAll(f => DateTime.UtcNow - f.FailedAtUtc > TimeSpan.FromHours(24));
     }
 
     /// <summary>Update a single method inside an existing persisted state (Quick Recheck / connect).</summary>
