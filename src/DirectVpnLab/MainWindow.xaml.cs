@@ -563,11 +563,14 @@ public partial class MainWindow : Window
             var diag = new ProxyTunCompareDiagnostic(_log, _cred, _connection);
             var report = await diag.RunAsync(c01, ct);
             TxtSpeedVpn.Text =
-                $"DIAG: P={report.Proxy.Outcome}/{report.Proxy.BytesReceived}B  T={report.Tun.Outcome}/{report.Tun.BytesReceived}B";
+                $"DIAG: P={report.Proxy.DownloadStatus}/{report.Proxy.BytesReceived}B " +
+                $"T={report.Tun.DownloadStatus}/{report.Tun.BytesReceived}B [{report.Confidence}]";
             SetUiState(
                 report.CleanupOk ? ConnectionUiState.Disconnected : ConnectionUiState.Failed,
-                report.CleanupOk ? report.Summary : report.CleanupDetail);
-            _log.Info($"DIAG hypothesis: {report.Hypothesis}");
+                report.CleanupOk ? Truncate(report.Summary, 78) : report.CleanupDetail);
+            _log.Info($"DIAG hypothesis[{report.Confidence}]: {report.Hypothesis}");
+            if (!string.IsNullOrWhiteSpace(report.NextStep))
+                _log.Info($"DIAG nextStep: {report.NextStep}");
         }
         catch (OperationCanceledException)
         {
